@@ -290,6 +290,8 @@
     Each NOOP cycle still does full memory read/write.
     With confidence gate: sparse-density reads → more NOOP cycles
     → search different addresses → maybe find denser neighborhoods.
+    No separate halt head needed — NOOP achieves the same effect
+    with simpler, uniform cycle logic.
 
   RVQ layers:
     Layer 1 = semantic gist (most partial, most abstract)

@@ -676,6 +676,9 @@ timestamp beyond threshold) signals a new work unit boundary.
    With 8 parallel agents doing speculative generation: ~160-400K TPS
    throughput. Achievable, but requires batch-level parallelism, not
    single-request speed.
+   
+   Clarification needed: Is 250K TPS total throughput (across concurrent
+   requests) or per-request latency?
 
 4. **Training in pure Rust / candle (P1)**
    candle supports training but the ecosystem is young. Missing:
@@ -740,7 +743,8 @@ timestamp beyond threshold) signals a new work unit boundary.
    Confidence gate is pre-trained on simple write/read density patterns
    before tackling partiality. Write diffusion creates density differences
    quickly (even a few writes create observable halos). Hallucination
-   penalty in loss keeps specificity in check.
+   penalty in loss keeps specificity in check. Monitor imagination/factual
+   ratio during training.
 
 8. **Flat-array memory overhead (P2)**
    Each trie node with [Option<u32>; 256] children = 1KB overhead just
@@ -826,20 +830,24 @@ timestamp beyond threshold) signals a new work unit boundary.
 | Video generation | Spatial + spectral tiling + temporal chunking | All three axes combined |
 | Trie role | Knowledge retrieval ONLY | Not for tile coordination or chunk state |
 | Scratchpad role | Agent coordination + state sharing | Tiles, chunks, refinement passes all use scratchpad |
-| Tokenization | VQ-256 codebooks per modality | Everything maps to codes, uniform interface |
+| Tokenization | VQ-256 codebooks per modality, byte vocab (0-255) | Everything maps to bytes, uniform interface |
 | Training | 8-phase curriculum (1→2→3→4→5→6→7→8) | Easiest first, progressive freeze/unfreeze, AddrNet after base |
-| Training principle | Progressive freeze/unfreeze | Freeze what's learned, train harder parts on stable foundations |
-| Text VQ refinement | Semantic layers: K=1=concepts, K=2=language, K=3=formatting | Pseudocode → target language → formatted code. Same pattern for chat |
+| Training principle | Progressive freeze/unfreeze | Freeze what's learned, train harder parts on stable foundations, gradual coherence |
+| Text VQ refinement | Semantic layers: K=1=concepts, K=2=language, K=3=formatting | Pseudocode → target language → formatted code. Same pattern for chat: intent → words → emoji/style |
 | Text VQ codec | Perceiver-style learned adaptive compression | Discovers word/character boundaries per language, no explicit tokenizer |
 | Text compression | Learned adaptive (not fixed-stride) | Fixed stride splits multi-byte UTF-8 chars; Perceiver handles variable-width |
 | Emoji enrichment | RVQ Layer 3 + continuous VAD space | Emojis = largest emotional dataset; cross-modal bridge for tone |
 | Enrichment output | Actual Unicode emojis inline | 4 bytes per emoji, negligible at 250K TPS |
-| Unknown enrichment | UNKNOWN_CODE (not neutral) | External input with no emotional info → explicit unknown |
+| Unknown enrichment | UNKNOWN_CODE (not neutral) | External input with no emotional info → explicit unknown, not assumed neutral |
 | Core agent input | VQ codes (0-255), not raw bytes | Code 0x41 = "codebook entry 65", not "A" — modality-blind |
 | Partiality model | Imagination via hierarchical trie | Sparse fine levels → model infers from coarse. See PARTIALITY.md |
 | Confidence signal | Duplex density (structural) | populated_children per ancestor → density chain → confidence gate |
 | Write diffusion | Gravitational density halo | Writes probabilistically create siblings, cousins. See MEMORY.md |
+| Confidence compounding | Parent density flows to children | Dense parent → confident context for child reads. Sparse parent → uncertain child. Density propagates naturally |
 | Confidence gate | Learned gate from density+depth chain | ~2,129 params. density_embedding + depth_embedding → sigmoid |
+| Write strength × confidence | Sparse → weak write, dense → strong | Feedback loop: weak data + later observation → diffusion halo grows → density rises → solid knowledge |
+| Partiality training | Phase 6 with asymmetric losses | After coherence unfreeze. Multi-view, imagination quality, hallucination penalty |
+| UTF-8 vs UTF-16 | Irrelevant (codec handles internally) | Core agents see only VQ codes, never raw bytes |
 
 ---
 

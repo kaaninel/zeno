@@ -124,14 +124,29 @@ The weights learn *how* to read and write. The trie stores *what* was learned.
 7. **Async non-blocking memory** — L0 gives instant coarse context, deeper
    results arrive progressively. Agents never stall.
 
-8. **Unified VQ-256** — All modalities use the same codec pipeline. Core
-   agents are modality-blind. Add a modality = train a codec.
+8. **Full Rust + candle** — No Python, no FFI overhead. Metal > CUDA > CPU.
+   Pure Rust from training to inference for maximum throughput.
 
-9. **Learned adaptive text compression** — Perceiver cross-attention discovers
-   word/character boundaries per language. No explicit tokenizer.
+9. **Unified VQ-256** — All modalities use the same codec pipeline. Core
+   agents are modality-blind — code 0x41 means "codebook entry 65", not "A".
+   All content knowledge lives in codecs + trie, weights are pure computation.
 
-10. **Partiality & imagination** — Trie density encodes what's known vs
-    imagined. Confidence gate prevents hallucination.
+10. **Symmetric encoder/decoder per modality** — Each codec is a standalone
+    VQ-VAE (Perceiver compress → RVQ quantize → Perceiver decompress).
+
+11. **Learned adaptive text compression** — Perceiver cross-attention discovers
+    word/character boundaries per language automatically. No language-specific
+    rules. Multi-byte scripts (Russian, Hindi) get 4× context window improvement.
+
+12. **Tool token protocol** — Byte-level tool dispatch at chunk boundaries.
+    Tool results are standard tagged units, same format as any input.
+
+13. **Emoji enrichment** — RVQ Layer 3 captures tone/emotion in continuous VAD
+    space. Emojis are the training signal, cross-modal bridge for audio tone.
+
+14. **Partiality & imagination** — Trie density encodes what's known vs
+    imagined. Confidence gate prevents hallucination. Imagination → weak write,
+    no halo → observation → strong write + diffusion halo → solid knowledge.
 
 ## Repository Structure
 
