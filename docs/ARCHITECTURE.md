@@ -507,25 +507,28 @@ timestamp beyond threshold) signals a new work unit boundary.
   Korean Hangul       3           ~2          ~6
   Emoji               4           ~1          ~4
 
-  Effective context window (256 VQ codes, K=3 RVQ → 85 positions):
+  Effective context window (256 VQ codes per chunk, one RVQ layer per chunk):
+  Each chunk = 256 content positions. K=3 RVQ layers → 3 sequential chunks
+  in a pipeline: Agent→L1 codes → Agent→L2 codes → Agent→L3 codes.
+  Same base agent, each pass gets previous layer's output as input.
 
   Language   Bytes/position  Chars/pos  Words/window  vs raw 256 bytes
   ────────  ──────────────  ─────────  ────────────  ────────────────
-  English    ~5              ~5         ~85 words     1.7× (was ~50)
-  Chinese    ~3              ~1         ~85 words     1.0× (was ~85)
-  Russian    ~8              ~4         ~85 words     4.0× (was ~21)
-  Arabic     ~6              ~3         ~85 words     2.4× (was ~35)
-  Hindi      ~9              ~3         ~85 words     4.3× (was ~20)
+  English    ~5              ~5         ~256 words    5.1× (was ~50)
+  Chinese    ~3              ~1         ~256 words    3.0× (was ~85)
+  Russian    ~8              ~4         ~256 words    12.2× (was ~21)
+  Arabic     ~6              ~3         ~256 words    7.3× (was ~35)
+  Hindi      ~9              ~3         ~256 words    13× (was ~20)
 
   Key insight: multi-byte scripts (Russian, Hindi, Arabic) benefit MOST
   from VQ compression because raw byte processing wastes context window
   on UTF-8 continuation bytes. Chinese benefits least because each 3-byte
   character already carries one word of meaning.
 
-  With K=2 RVQ (128 positions):
-  English: ~128 words (2.6× improvement)
-  Chinese: ~128 words (1.5× improvement)
-  Russian: ~128 words (6× improvement!)
+  With K=1 only (single chunk, no refinement):
+  English: ~256 words (semantic gist, immediate output)
+  Chinese: ~256 words (same — uniform positions)
+  Russian: ~256 words (massive improvement over raw bytes)
 
   UTF-8 vs UTF-16 is IRRELEVANT in VQ world:
     The text codec handles raw bytes internally.
@@ -758,11 +761,9 @@ timestamp beyond threshold) signals a new work unit boundary.
     candle has basic LoRA support but it's less mature than PyTorch's PEFT.
     May need custom implementation for tool-specialized LoRA.
 
-12. **Scratchpad write conflicts (P3)**
-    N agents writing to 16 shared slots. Need atomic operations or
-    deterministic ordering.
-    Mitigation: Atomic f32 adds on GPU. Or: per-agent owned slots (ring
-    buffer style) with all-read access.
+12. **Scratchpad write conflicts (P3) — RESOLVED**
+    Strength-weighted mean across all agents: `slot[i] = Σ(strength × value) / Σ(strength)`.
+    Fully parallel, no atomics, fully differentiable. See SWARM.md scratchpad section.
 
 13. **Image/audio generators at 5-20M (Phase 2+ risk)**
     Generating high-quality images from 5-20M params is very difficult.
@@ -779,7 +780,7 @@ timestamp beyond threshold) signals a new work unit boundary.
 | Language | Full Rust (candle) | 250K TPS, no FFI overhead |
 | Agent type | Homogeneous base + LoRA | Simple training, flexible specialization |
 | Agent size | ~666K params (d_model=96) | Sweet spot: expressive + fast |
-| Context window | 256 VQ codes per chunk, one RVQ layer per chunk | Refinement = more sequential chunks. Text K=1=semantic, K=2=language, K=3=formatting |
+| Context window | 256 VQ codes per chunk, one RVQ layer per chunk | 3-agent pipeline: L1→L2→L3. Each agent gets previous layer's output as input. K=1 alone gives semantic preview. Same base agent. |
 | Tiling | Work-queue (spatiotemporal boundaries) | Natural splitting, no wasted context, variable-size units |
 | Headers | HTTP-inspired dual-channel (VQ-encoded inline + side-channel) | Headers go through VQ like everything else; side-channel provides structured enrichment |
 | Tag injection | VQ-encoded inline + side-channel (input-only) | Same VQ codebook for tags and content; 10 encoded vectors via cross-attention |

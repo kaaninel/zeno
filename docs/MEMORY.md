@@ -239,11 +239,10 @@ to the trie. Memory is not optional.
     Write values: base + aspect residuals (3 different per-channel values):
       base  = V_proj(hidden)              — shared core representation
       val_i = base + aspect_i(hidden)     — channel-specific emphasis (96→16→96)
-    Write strength: α_effective = sigmoid(strength_head(hidden)) × confidence_gate × base_α
-      confidence_gate comes from the learned density gate (see PARTIALITY.md):
-      Sparse source → low confidence → weak write (tentative).
-      Dense source → high confidence → stronger write (confident).
-      Always writes (trail of thoughts), but model AND density control intensity.
+    Write strength: α = sigmoid(strength_head(hidden))
+      α controls the blend ratio: trie[addr] = (1-α) × old + α × new
+      Low α = gentle nudge (re-encounter). High α = strong overwrite (new content).
+      Always writes (trail of thoughts), model controls intensity via α.
     Write diffusion: primary write + probabilistic sibling/cousin writes
       (see § Write Diffusion above). LOCAL ONLY — diffusion never propagates to L3.
       All diffused writes go to the same local write buffer.

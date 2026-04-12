@@ -4,7 +4,7 @@ This document provides hardware-specific performance estimates for Zeno inferenc
 with explicit reasoning chains so deviations can be traced to their root cause.
 
 **Key model parameters:**
-- Core agent: d_model=96, 4 transformer blocks, 4 heads, d_ff=384, vocab=512 → **666K params = 2.66 MB FP32**
+- Core agent: d_model=96, 4 transformer blocks, 4 heads, d_ff=192 (2×d_model), vocab=256 → **666K params = 2.66 MB FP32**
 - VQ codec: ~300K params (separate from core agent)
 - KV cache per request at seq_len=256: 4 layers × 2 (K,V) × 256 × 96 × 4 bytes = **786 KB**
 
@@ -98,11 +98,11 @@ At M4 DRAM ceiling (90K tok/s per agent group), 250K TPS requires:
 Training processes a full sequence at once (not autoregressive), so attention is O(seq²):
 
 - Attention (4 layers, seq=256, d=96): `2 × 256² × 96 × 4` = 50.3 MFLOP
-- FFN (4 layers, seq=256, d_ff=384): `2 × 256 × 96 × 384 × 2 × 4` = 150.9 MFLOP
-- Output head: `256 × 512 × 2` = 0.3 MFLOP
-- **Forward per sample: 201 MFLOP**
-- **Backward: ~2× forward = 402 MFLOP**
-- **Full step (batch=32): 19.35 GFLOP**
+- FFN (4 layers, seq=256, d_ff=192): `2 × 256 × 96 × 192 × 2 × 4` = 75.5 MFLOP
+- Output head: `256 × 256 × 2` = 0.13 MFLOP
+- **Forward per sample: 126 MFLOP**
+- **Backward: ~2× forward = 252 MFLOP**
+- **Full step (batch=32): 12.1 GFLOP**
 
 **Attention matrix memory per step:** `256² × 32 × 4 bytes × 4 layers` = **33.6 MB** (must be materialized;
 candle has no FlashAttention). This is under 0.15% of M4's 24GB RAM — memory is not a constraint.
@@ -161,8 +161,8 @@ Gate-adjusted total assumes 3 of the 8 phases need 2× steps, adding 30–50% wa
 **Primary bottleneck:** Codebook diversity requirements.
 - Stage 3 (codebook diversity > 95%): codebook collapse is the most common failure mode in VQ training.
   Expect 1–3 restarts with different temperature settings before this gate passes.
-- Stage 5 (emoji enrichment): layer 3 dual-role conflict (see ISSUES.md #7) may require
-  partitioning the layer 3 codebook to separate reconstruction and enrichment losses.
+- Stage 5 (emoji enrichment): layer 3 is purely enrichment (no reconstruction loss),
+  dedicated entirely to emoji/emotion/tone. No partition needed.
 
 **Expected convergence on M4:** 45–90 min nominal + 1–2× overhead for restarts = **2–4 hrs total**.
 **Success criterion:** Reconstruction loss < 0.01 AND codebook utilization > 95%.
@@ -181,7 +181,7 @@ Gate-adjusted total assumes 3 of the 8 phases need 2× steps, adding 30–50% wa
 AddrNet produces degenerate addresses (all zeros, or identity-hash of input). Must monitor address
 entropy bits and locality ratio metrics explicitly.
 **Expected convergence on M4:** 12–25 min nominal. May be longer if address entropy fails to grow.
-**Success criterion:** Address entropy > 6 bits (out of 8 max for 8-byte addresses). Locality ratio < 0.3 (addresses disperse across trie rather than clustering at root).
+**Success criterion:** Address entropy > 7 bits (out of 8 max for 8-byte addresses). Locality ratio < 0.3 (addresses disperse across trie rather than clustering at root).
 **Risk:** MEDIUM. Cannot rely on loss curve alone; needs explicit entropy monitoring in observability.
 
 #### Phase 4: Memory Integration (15K steps) ⚠️ CRITICAL PHASE
@@ -190,7 +190,7 @@ entropy bits and locality ratio metrics explicitly.
 Training data must be constructed such that writes precede reads by ≥1 step.
 If sync-write path fails, retrieval accuracy will be 0% and the phase will not converge.
 **Expected convergence on M4:** 40–80 min (optimistic) if sync writes work correctly.
-**Success criterion:** Retrieval accuracy > 80%. Gate is binary — passes or fails.
+**Success criterion:** Retrieval accuracy > 90%. Gate is binary — passes or fails.
 **Risk:** HIGH. This phase has the only confirmed architectural constraint that can cause total failure.
 First benchmark: run Phase 4 with 100-step smoke test and check `write_before_read_success_pct` metric is 100%.
 
@@ -218,8 +218,8 @@ or always hallucinates (creative but unreliable).
 - Scratchpad: strength-weighted mean, fully parallel, no atomics
 
 **Expected convergence on M4:** 55–110 min nominal at N=4–8 swarm agents.
-**NOOP calibration:** Model has never seen NOOP as a training target in Phases 1–6 (ISSUES.md #9).
-Phase 7 first few hundred steps will show near-zero NOOP rate as the model re-calibrates.
+**NOOP calibration:** NOOP (filler token) is present in training data for ALL phases at ~1-2% of positions.
+Phase 7 NOOP rate should already be reasonable; swarm coordination may initially under-use it.
 **Risk:** HIGH for swarm coordination quality. MEDIUM for convergence speed.
 
 #### Phase 8: Tool Integration (10K steps)

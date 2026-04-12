@@ -157,11 +157,10 @@
   │       (low-confidence vectors get attenuated in cross-attention)   │
   │                                                                    │
   │    2. Write strength:                                              │
-  │       α_effective = sigmoid(strength_head(hidden)) × confidence    │
-  │                     × base_α                                       │
-  │       (representations derived from sparse/uncertain sources get    │
-  │        written weakly — they stay tentative until diffusion halo   │
-  │        builds and density confirms the pattern)                    │
+  │       α = sigmoid(strength_head(hidden))                           │
+  │       Low α = gentle nudge, high α = strong overwrite.             │
+  │       Confidence gate is READ-ONLY — it modulates memory           │
+  │       attention values, not write strength.                        │
   │                                                                    │
   │  Parameter cost:                                                   │
   │    density_embedding: 256 × 8-dim = 2,048 params                  │
