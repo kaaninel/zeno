@@ -141,7 +141,8 @@ to store (reasoning state, partial results, working memory).
   Lifecycle:
     - ZERO-RESET when agent picks up a new work unit
     - PERSIST across 256-token chunk continuations (same unit)
-    - Updated via GRU gate each token (model controls what to store)
+    - FIFO ring buffer: each token pushes current hidden, oldest drops
+      (no learned update mechanism — cross-attention handles selection)
 
   Access: unified context cross-attention alongside tag vectors
     Attention pool = [T0..T9, R0, R1, R2, R3]   (14 slots total)
@@ -298,13 +299,13 @@ timestamp beyond threshold) signals a new work unit boundary.
     Self-Attention (Q,K,V,O)       36,864
     Context Cross-Attn (Q,K,V,O)   36,868
       (attends to 14 slots: 10 tag + 4 register)
-    Register GRU gate (d→4d + d→4) ~1,000
+    Register ring buffer              0     (state only, no learned params)
     Memory Cross-Attn (Q,K,V,O)    36,868
     FFN (up + down)                36,864
     RMSNorm × 4                       384
-    Subtotal per layer:           ~148,848
-    × 4 layers =                             ~595,400   89.4%
-  3× AddrNet (~7K each)                       21,000     3.2%
+    Subtotal per layer:           ~147,848
+    × 4 layers =                             ~591,392   89.6%
+  3× AddrNet (Conv1D, ~4.4K each)             13,188     2.0%
   V_proj (96 → 96)                  9,312     1.4%  (shared base value)
   3× Aspect Head (96→16→96 each)    9,552     1.4%  (channel residuals)
   Write Strength Head (96 → 1)          97     0.0%
@@ -323,9 +324,10 @@ timestamp beyond threshold) signals a new work unit boundary.
     null_vec + ephemeral_vec + indef_vec    288   0.0%
   Register Bank (4 × 96)              384     —     (state, not params)
   Final RMSNorm                        96     0.0%
+  Scratchpad Write Attn (W_q+W_k)  1,536     0.2%  (active Phase 7+)
   LM Head                     (tied with code embed)
   ─────────────────────────────    ────────   ─────
-  TOTAL (estimated)               ~666,000   ~100%
+  TOTAL (estimated)               ~655,000   ~100%
 ```
 
 ---
@@ -392,10 +394,10 @@ timestamp beyond threshold) signals a new work unit boundary.
     K=3: exact + nuance  (exact text + enrichment, near-lossless media)
     K=4+: high fidelity  (studio audio, detailed image)
 
-  Layer roles for TEXT specifically:
-    Layer 1: semantic gist ("greeting about the weather")
-    Layer 2: exact character reconstruction ("Hello, how's the weather?")
-    Layer 3: enrichment/nuance (tone, emphasis, emoji → 😊)
+  Layer roles for TEXT (progressive residual refinement):
+    Layer 1: coarse semantic output (rough but self-sufficient)
+    Layer 2: + language-specific residual → near-perfect reconstruction
+    Layer 3: + final residual → style, emoji, nuance polish
 
 
   Progressive byte ordering
@@ -420,15 +422,15 @@ timestamp beyond threshold) signals a new work unit boundary.
   │  ENCODER: UTF-8 bytes → VQ codes                                  │
   │  ─────────────────────────────────                                │
   │  1. Byte embed: 256 × d_codec → (N, d_codec)                     │
-  │     d_codec = 64-128 (codec has its own embedding dimension)      │
+  │     d_codec = 64 (codec has its own embedding dimension)           │
   │  2. Positional encoding (sinusoidal, byte positions)              │
-  │  3. Small transformer (1-2 layers): captures local UTF-8 structure│
+  │  3. Small transformer (1 layer): captures local UTF-8 structure   │
   │     → (N, d_codec) encoded byte sequence                          │
   │                                                                   │
   │  4. Perceiver cross-attention (THE KEY STEP):                     │
-  │     Q = M learned latent queries (M << N, compression target)     │
+  │     Q = 256 learned latent queries (M=256, one per output position)│
   │     K, V = encoded byte sequence (N, d_codec)                     │
-  │     → (M, d_codec) compressed latent sequence                     │
+  │     → (256, d_codec) latent sequence                              │
   │                                                                   │
   │     Each latent position LEARNS which bytes to attend to.         │
   │     Attention pattern = learned adaptive tokenization:            │
@@ -440,25 +442,27 @@ timestamp beyond threshold) signals a new work unit boundary.
   │     No explicit boundary prediction needed.                       │
   │     Attention IS the segmentation. Fully differentiable.          │
   │                                                                   │
-  │  5. RVQ quantization: each latent → K byte codes (K=2-3)         │
-  │     Layer 1: meaning/gist                                         │
-  │     Layer 2: exact character reconstruction                       │
-  │     Layer 3: enrichment/nuance (emotional, tonal, emoji)          │
+  │  5. RVQ quantization: each latent → K byte codes (K=3)            │
+  │     Progressive residual refinement (standard RVQ):               │
+  │     Layer 1: coarse — self-sufficient semantic output              │
+  │     Layer 2: residual — language-specific refinement               │
+  │     Layer 3: residual — final polish (style, emoji, nuance)        │
+  │     All layers get reconstruction loss on cumulative residual.     │
   │                                                                   │
-  │  Output: M × K byte codes (progressive ordering)                  │
+  │  Output: 256 × 3 byte codes (progressive ordering)                │
   │                                                                   │
   │                                                                   │
   │  DECODER (symmetric): VQ codes → UTF-8 bytes                      │
   │  ──────────────────────────────────────                           │
   │  1. Code lookup: VQ codes → codebook vectors → sum RVQ layers     │
-  │     → (M, d_codec) latent sequence                                │
+  │     → (256, d_codec) latent sequence                              │
   │                                                                   │
   │  2. Reverse Perceiver cross-attention:                             │
   │     Q = N positional queries (byte positions to reconstruct)      │
-  │     K, V = M latent vectors                                       │
+  │     K, V = 256 latent vectors                                     │
   │     → (N, d_codec) reconstructed byte embeddings                  │
   │                                                                   │
-  │  3. Small transformer (1-2 layers): local refinement              │
+  │  3. Small transformer (1 layer): local refinement                 │
   │  4. Per-position: d_codec → 256 logits → byte                     │
   │  5. Target: EXACT match with original UTF-8 bytes                 │
   │                                                                   │
@@ -544,9 +548,9 @@ timestamp beyond threshold) signals a new work unit boundary.
   add that information back. Zeno formalizes this.
 
   In the text VQ codec:
-    Layer 1 codes: semantic content ("greeting about weather")
-    Layer 2 codes: exact characters ("Hello, how's the weather?")
-    Layer 3 codes: enrichment ("warm, genuine enthusiasm → 😊")
+    Layer 1 codes: coarse output ("greeting about weather" — rough but functional)
+    Layer 2 codes: + residual → exact characters ("Hello, how's the weather?")
+    Layer 3 codes: + residual → style/emotion polish ("warm, genuine enthusiasm → 😊")
 
   The continuous latent space (before VQ quantization) captures ALL of
   this — content, form, and emotion — in one representation. The VQ
@@ -570,9 +574,10 @@ timestamp beyond threshold) signals a new work unit boundary.
     Emoji becomes the LINGUA FRANCA between modalities.
 
   External input (no enrichment info):
-    Incoming flat text from outside → Layer 3 = UNKNOWN_CODE
-    Not inferred (unreliable), not neutral (that's a claim).
-    Explicitly "unknown" — the model knows what it doesn't know.
+    Incoming flat text from outside → Layer 3 has minimal residual
+    (no style/emotion to capture). The standard RVQ residual mechanism
+    handles this naturally — L3 codes for unstyled text just encode
+    small corrections, not a special UNKNOWN_CODE.
 
   Emoji in generated output:
     Core agent generates VQ codes → text codec decoder → UTF-8 bytes
@@ -821,7 +826,7 @@ timestamp beyond threshold) signals a new work unit boundary.
 | Text compression | Learned adaptive (not fixed-stride) | Fixed stride splits multi-byte UTF-8 chars; Perceiver handles variable-width |
 | Emoji enrichment | RVQ Layer 3 + continuous VAD space | Emojis = largest emotional dataset; cross-modal bridge for tone |
 | Enrichment output | Actual Unicode emojis inline | 4 bytes per emoji, negligible at 250K TPS |
-| Unknown enrichment | UNKNOWN_CODE (not neutral) | External input with no emotional info → explicit unknown, not assumed neutral |
+| Unstyled input | Minimal L3 residual (natural RVQ behavior) | External input with no emotional info → L3 codes encode small corrections, no special token needed |
 | Core agent input | VQ codes (0-255), not raw bytes | Code 0x41 = "codebook entry 65", not "A" — modality-blind |
 | Partiality model | Imagination via hierarchical trie | Sparse fine levels → model infers from coarse. See PARTIALITY.md |
 | Confidence signal | Duplex density (structural) | populated_children per ancestor → density chain → confidence gate |

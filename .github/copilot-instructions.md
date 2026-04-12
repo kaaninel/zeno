@@ -57,10 +57,10 @@ unified attention pool.
 ### Output Heads
 
 - LM head → 256 logits (weight-tied with code embedding)
-- 3× AddrNet → write addresses (8 levels each, Gumbel-softmax)
+- 3× AddrNet → write addresses (8 levels each, Conv1D, Gumbel-softmax)
 - V_proj + 3 aspect heads → write values with channel-specific residuals
 - write_strength head → α modifier
-- Confidence gate → modulates reads and writes by trie density
+- Confidence gate → modulates reads by trie density (READ-ONLY)
 
 ## Key Conventions
 
@@ -70,9 +70,10 @@ All modalities (text, image, audio) pass through VQ-256 codecs before reaching
 core agents. Core agents are modality-blind — they only see codes 0-255. Content
 knowledge lives in codecs + trie, never in agent weights.
 
-RVQ uses 3 layers: Layer 1 = semantic/meaning, Layer 2 = exact reconstruction,
-Layer 3 = enrichment/style/emoji. Byte ordering is progressive:
-`[all coarse] + [all mid] + [all fine]`.
+RVQ uses 3 layers with progressive residual refinement:
+Layer 1 = coarse self-sufficient output, Layer 2 = language refinement residual,
+Layer 3 = final polish residual (style/emoji/nuance). All layers get reconstruction loss.
+Byte ordering: `[all coarse] + [all mid] + [all fine]`.
 
 ### Trie Memory
 
@@ -111,32 +112,34 @@ partiality → swarm → tools/chat. See `docs/TRAINING.md` for gate criteria.
 ### Partiality & Confidence
 
 The confidence gate (~2,129 params) converts trie density chains into a scalar
-that modulates both memory attention values and write strength. Sparse paths →
-weak reads/writes (imagination). Dense paths → strong reads/writes (knowledge).
+that modulates memory attention values (READ-ONLY). Sparse paths →
+weak reads (imagination). Dense paths → strong reads (knowledge).
 This is not binary — it's a continuous gradient derived from structural density.
 
 ### Scratchpad
 
 Fixed 16 × d_model tensor on GPU shared by all agents in a work group.
-Strength-weighted mean blending every step: scratchpad[i] = Σ(strength × value) / Σ(strength).
-Fully parallel, no atomics, fully differentiable. Defines work group boundaries (GPU SMEM analogy).
+Attention-based write: agent hidden cross-attends to scratchpad slots (W_q+W_k, 1,536 params).
+Content-aware slot targeting, self-organizing. Fully parallel, fully differentiable.
+Defines work group boundaries (GPU SMEM analogy).
 
 ### Constants
 
 | Name | Value | Notes |
 |---|---|---|
 | `d_model` | 96 | Core embedding dimension |
+| `d_codec` | 64 | VQ codec embedding dimension |
 | `vocab_size` | 256 | VQ codebook size (byte-level) |
 | `context_window` | 256 | Tokens per chunk |
 | `n_heads` | 4 | Attention heads |
-| `agent_params` | ~666K | Total per agent |
-| `RVQ layers (K)` | 3 | Coarse / mid / fine |
+| `agent_params` | ~655K | Total per agent |
+| `RVQ layers (K)` | 3 | Progressive residual refinement |
 | `trie_depth` | 8 | Maximum trie levels |
 | `trie_arity` | 256 | Children per node |
 | `scratchpad_slots` | 16 | Shared coordination slots |
 | `attention_pool_slots` | 14 | Context cross-attn: 10 tag + 4 register |
 | `memory_pool_slots` | 22 | Memory cross-attn: 3 trie + 16 scratchpad + 3 async |
-| `register_bank` | 4 | Internal state slots per agent |
+| `register_bank` | 4 | FIFO ring buffer (last 4 hiddens) |
 
 ## MCP Servers
 

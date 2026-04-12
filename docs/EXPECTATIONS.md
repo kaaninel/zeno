@@ -4,8 +4,8 @@ This document provides hardware-specific performance estimates for Zeno inferenc
 with explicit reasoning chains so deviations can be traced to their root cause.
 
 **Key model parameters:**
-- Core agent: d_model=96, 4 transformer blocks, 4 heads, d_ff=192 (2×d_model), vocab=256 → **666K params = 2.66 MB FP32**
-- VQ codec: ~300K params (separate from core agent)
+- Core agent: d_model=96, 4 transformer blocks, 4 heads, d_ff=192 (2×d_model), vocab=256 → **~655K params ≈ 2.62 MB FP32**
+- VQ codec: ~156K params (d_codec=64, M=256 latents, 1 encoder/decoder layer, commitment β=0.25)
 - KV cache per request at seq_len=256: 4 layers × 2 (K,V) × 256 × 96 × 4 bytes = **786 KB**
 
 ---
@@ -16,8 +16,8 @@ with explicit reasoning chains so deviations can be traced to their root cause.
 
 The model is always **memory-bandwidth-bound** during inference, never compute-bound.
 
-**Why:** FLOP/byte ratio needed = 2 FLOPs per parameter × 666K params / (2.66 MB weights + 0.786 MB KV)
-= 1.33 GFLOP / 3.45 MB = **0.39 FLOP/byte**. All hardware listed delivers 10–100 FLOP/byte of
+**Why:** FLOP/byte ratio needed = 2 FLOPs per parameter × 655K params / (2.62 MB weights + 0.786 MB KV)
+= 1.31 GFLOP / 3.41 MB = **0.38 FLOP/byte**. All hardware listed delivers 10–100 FLOP/byte of
 arithmetic intensity capability. The computation is 25–250× faster than memory bandwidth allows,
 so bandwidth is the bottleneck 100% of the time.
 
@@ -161,8 +161,8 @@ Gate-adjusted total assumes 3 of the 8 phases need 2× steps, adding 30–50% wa
 **Primary bottleneck:** Codebook diversity requirements.
 - Stage 3 (codebook diversity > 95%): codebook collapse is the most common failure mode in VQ training.
   Expect 1–3 restarts with different temperature settings before this gate passes.
-- Stage 5 (emoji enrichment): layer 3 is purely enrichment (no reconstruction loss),
-  dedicated entirely to emoji/emotion/tone. No partition needed.
+- Stage 5 (emoji enrichment): Layer 3 gets both reconstruction loss (residual) and emoji
+  classification loss. The residual naturally captures style/emotion, emoji loss sharpens it.
 
 **Expected convergence on M4:** 45–90 min nominal + 1–2× overhead for restarts = **2–4 hrs total**.
 **Success criterion:** Reconstruction loss < 0.01 AND codebook utilization > 95%.

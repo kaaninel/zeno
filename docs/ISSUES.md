@@ -88,17 +88,16 @@ Agents in different work groups cannot communicate.
   ```
   scratchpad[i] = Σ_agents(strength[a][i] × value[a][i]) / Σ_agents(strength[a][i])
   ```
-- **Automatic update**: each agent applies a small FFN to its hidden state to produce write
-  values and strengths per slot. No explicit write decision — all agents update every step.
+- **Automatic update**: each agent cross-attends to scratchpad slots (W_q + W_k, 1,536 params)
+  to decide where to write. Content-aware slot targeting, self-organizing.
 - **Work group size**: dynamic, 1–N_max agents. N_max configurable at launch (supports up to
   128+ agents for large tasks like tiling a high-resolution image). Inactive agent slots are
   zero-masked (strength=0 → no contribution).
 - **Per-agent register bank** (4 slots) handles private per-agent bookkeeping and is separate
   from the shared scratchpad (lives in context cross-attention, not memory cross-attention).
 
-The `write_strength` sigmoid head used for trie writes doubles as scratchpad write strength
-per slot. No new parameters needed beyond a small FFN (~16 × d_model params) to project
-hidden state to per-slot write values.
+Scratchpad write uses attention-based slot targeting (W_q + W_k, ~1,536 params per agent).
+Agent hidden state cross-attends to scratchpad contents to decide write targets.
 
 **Documented in:** `docs/SWARM.md` (scratchpad section), `docs/ARCHITECTURE.md` (work group)
 
@@ -123,10 +122,10 @@ then pooled, then attended to. No new encoder params.
 **Problem:** Layer 3 must both close reconstruction to 99.5% accuracy AND specialize for
 emoji/emotional enrichment. The two losses pull the codebook in opposite directions.
 
-**Decision (revised):** **No partition needed.** Layers 1-2 alone provide 256×256 = 65K code
-combinations — massive overkill for 256 byte values. Text reconstruction does not need Layer 3.
-Layer 3 is 100% dedicated to enrichment/emoji/emotion. No reconstruction loss on Layer 3.
-No partition, no dual-objective conflict. Simpler training, cleaner design.
+**Decision (revised):** **Standard progressive RVQ residual refinement.** All 3 layers get
+reconstruction loss on their cumulative residual. Layer 1 = coarse self-sufficient output,
+Layer 2 = language refinement residual, Layer 3 = final polish residual (including style/emoji
+when present). No special UNKNOWN_CODE needed — unstyled text naturally has minimal L3 residual.
 
 **Documented in:** `docs/TRAINING.md` (Phase 1 section)
 

@@ -278,10 +278,15 @@
     → Query remote trie for more data
     This IS a partiality response — detecting gaps and seeking more.
 
-  UNKNOWN_CODE for enrichment:
-    External text with no emotional info → UNKNOWN_CODE (not neutral)
-    Explicitly "I don't know the emotion" rather than guessing.
-    Same principle: represent what's missing, don't pretend completeness.
+  UNKNOWN_CODE concept removed — standard RVQ residual behavior:
+    External text with no emotional info → Layer 3 has minimal residual.
+    L3 codes for unstyled text naturally encode small corrections.
+    No special code reservation needed.
+
+  RVQ progressive refinement as partiality hierarchy:
+    Layer 1 = coarse output (most partial — rough but self-sufficient)
+    Layer 2 = + residual → near-complete (language-specific reconstruction)
+    Layer 3 = + residual → full quality (style, emoji, nuance polish)
 
   NOOP token (adaptive computation):
     NOOP (0x06) = "nothing to say yet" — model outputs NOOP when it
@@ -293,9 +298,9 @@
     with simpler, uniform cycle logic.
 
   RVQ layers:
-    Layer 1 = semantic gist (most partial, most abstract)
-    Layer 2 = exact reconstruction (more complete)
-    Layer 3 = enrichment (nuance, nearly full)
+    Layer 1 = coarse output (rough but self-sufficient)
+    Layer 2 = + residual → near-perfect reconstruction
+    Layer 3 = + residual → full quality (style, emoji, nuance)
     Progressive VQ IS a partiality hierarchy.
     Training with RVQ layer dropout = training with varying partiality.
 

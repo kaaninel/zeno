@@ -272,8 +272,8 @@ and tool dispatch.
     → text VQ decoder shows rough preview: "Hlo hw r yu?"
   Layer 2 generation (exact): generate reconstruction codes
     → text VQ decoder shows clean text: "Hello, how are you?"
-  Layer 3 generation (enrichment): generate tone/emoji codes
-    → text VQ decoder shows enriched: "Hello, how are you? 😊"
+  Layer 3 generation (polish): generate final refinement codes
+    → text VQ decoder shows polished: "Hello, how are you? 😊"
 
   Progressive rendering: user sees text appearing at Layer 1 speed,
   refinement layers improve quality as they arrive.
@@ -388,12 +388,18 @@ and tool dispatch.
   (supports up to 128+ agents for large tasks). Only active agents participate
   in the scratchpad update.
 
-  Update mechanism:
-    - Each agent applies a small FFN to its hidden state → per-slot (value, strength)
-    - Strength-weighted mean applied across all agents simultaneously:
-        scratchpad[i] = Σ_a(strength[a][i] × value[a][i]) / Σ_a(strength[a][i])
+  Update mechanism (attention-based write):
+    - Each agent's hidden state cross-attends to scratchpad contents:
+        Q = hidden · W_q (96→8), K = scratchpad · W_k (96→8)
+        weights = softmax(Q · K^T / √8)   per slot
+    - Blend: scratchpad[i] = weights[i] × hidden + (1-weights[i]) × scratch[i]
+    - Content-aware: write targets depend on what's already in each slot
+    - Self-organizing: slots specialize by content similarity, not assignment
+    - Cross-agent: strength-weighted mean resolves concurrent writes:
+        scratchpad[i] = Σ_a(weights[a][i] × hidden[a]) / Σ_a(weights[a][i])
     - Fully parallel, no atomics, fully differentiable
-    - Automatic: every agent contributes every step (strength gates actual influence)
+    - Automatic: every agent contributes every step (attention weights gate influence)
+    - Params: W_q(96×8) + W_k(96×8) = 1,536 per agent
 
   Uses:
     - Inter-tile coherence (edge hidden states between image quadrants)

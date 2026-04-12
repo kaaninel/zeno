@@ -34,10 +34,10 @@ address space collapse.
   Step 1 — Reconstruction (autoencoder):
     text bytes → Perceiver encoder → RVQ → Perceiver decoder → text bytes
     Loss: cross-entropy per reconstructed byte (exact match required)
-    K=3 RVQ layers, codebook size = 256 each
-    Reconstruction uses Layers 1-2 ONLY (65K combinations, massive overkill for 256 byte values).
-    Layer 3 has NO reconstruction loss — it is purely enrichment.
-    Gate: reconstruction accuracy > 99.5% across all scripts (Layers 1-2 only)
+    K=3 RVQ layers, codebook size = 256 each, d_codec=64, M=256 latents
+    Standard progressive RVQ: each layer encodes cumulative residual.
+    All 3 layers get reconstruction loss (Layer N loss = residual after Layers 1..N-1).
+    Gate: reconstruction accuracy > 99.5% across all scripts (all 3 layers)
 
   Step 2 — Codebook diversity:
     Loss: maximize entropy of code usage per RVQ layer
@@ -45,11 +45,11 @@ address space collapse.
     EMA codebook updates
     Gate: all 256 codes used > 0.1% frequency per layer
 
-  Step 3 — Emoji enrichment (Layer 3 specialization):
+  Step 3 — Emoji enrichment (Layer 3 fine-tuning):
     Data: text + emoji pairs (social media, chat)
     Loss: predict emoji from Layer 3 codes (classification)
-    Layer 3 is 100% dedicated to enrichment — no reconstruction loss, no partition needed.
-    Layer 1-2 handle all reconstruction (2 layers × 256 codes = 65K combos for 256 byte values).
+    Layer 3 residual naturally captures style/emotion (reconstruction handled by L1+L2).
+    Additional emoji classification loss sharpens L3's emotional signal.
     Gate: emoji prediction accuracy > 70% (top-5)
 
   Step 4 — Continuous emotional space:
@@ -230,8 +230,8 @@ address space collapse.
     LR: standard
     Duration: ~5K steps
 
-  Phase 5b — Unfreeze context cross-attention + register GRU
-    Train: context cross-attn + register + everything from 5a
+  Phase 5b — Unfreeze context cross-attention + register bank
+    Train: context cross-attn + register access + everything from 5a
     Keep frozen: self-attn, FFN, embedding, AddrNet
     LR: standard for newly unfrozen, 0.5× for 5a components
     Duration: ~5K steps
