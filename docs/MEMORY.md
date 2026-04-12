@@ -25,7 +25,7 @@ to the trie. Memory is not optional.
 
   L2 (Disk):     Overflow / cold storage
     mmap'd pages, OS page cache handles hot/cold
-    Page-aligned buckets (sized to M4 16KB pages)
+    Page-aligned buckets (4KB-aligned, works on all platforms)
     On-demand, high latency reads (~ms)
 
   L3 (Internet): Remote trie servers (read-only at inference)
@@ -98,10 +98,8 @@ to the trie. Memory is not optional.
 
   struct TrieBucket {
       // One bucket = one group of nodes at same depth
-      // Sized to align with OS page size (16KB on M4)
-      // 16KB / 384 bytes per node (d=96) = 42 nodes per page
-      // Round to 32 nodes per bucket (power of 2, ~12KB)
-      values: [[f32; D_MODEL]; BUCKET_SIZE],
+      // 4KB-aligned: 4096 / 384 bytes per node (d=96) = 10 → use 8 nodes per bucket (power of 2)
+      values: [[f32; D_MODEL]; BUCKET_SIZE],  // BUCKET_SIZE = 8
       children: [Option<u32>; BUCKET_SIZE * 256],
       // populated_children derived on read: count non-None in children slice
       // Zero extra storage — the trie structure IS the confidence signal

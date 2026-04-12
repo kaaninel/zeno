@@ -35,7 +35,9 @@ address space collapse.
     text bytes → Perceiver encoder → RVQ → Perceiver decoder → text bytes
     Loss: cross-entropy per reconstructed byte (exact match required)
     K=3 RVQ layers, codebook size = 256 each
-    Gate: reconstruction accuracy > 99.5% across all scripts
+    Reconstruction uses Layers 1-2 ONLY (65K combinations, massive overkill for 256 byte values).
+    Layer 3 has NO reconstruction loss — it is purely enrichment.
+    Gate: reconstruction accuracy > 99.5% across all scripts (Layers 1-2 only)
 
   Step 2 — Codebook diversity:
     Loss: maximize entropy of code usage per RVQ layer
@@ -46,8 +48,8 @@ address space collapse.
   Step 3 — Emoji enrichment (Layer 3 specialization):
     Data: text + emoji pairs (social media, chat)
     Loss: predict emoji from Layer 3 codes (classification)
-    Layer 1-2 handle content/reconstruction
-    Layer 3 specializes in emotional/tonal enrichment
+    Layer 3 is 100% dedicated to enrichment — no reconstruction loss, no partition needed.
+    Layer 1-2 handle all reconstruction (2 layers × 256 codes = 65K combos for 256 byte values).
     Gate: emoji prediction accuracy > 70% (top-5)
 
   Step 4 — Continuous emotional space:
@@ -63,6 +65,12 @@ address space collapse.
 
   Duration: ~10K steps
   Outcome: Frozen text VQ codec. Core agents train on its output codes.
+
+  Logging:
+    recon_loss: X.XXX          (reconstruction cross-entropy, target: low enough for >99.5% accuracy)
+    recon_accuracy: X.XX%      target > 99.5%
+    codebook_usage[layer]: min_freq    target > 0.1% per code per layer
+    emoji_top5_acc: X.XX%      target > 70%
 ```
 
 ---
@@ -85,6 +93,10 @@ address space collapse.
   Gate criterion: LM loss < 3.0 (code-level perplexity < 20)
   Duration: ~10K steps
   Outcome: Meaningful hidden states. Stable embeddings + attention.
+
+  Logging:
+    lm_loss: X.XXX             target < 3.0
+    mem_attn_mean_abs: X.XXXX  (expected near-zero, memory is OFF — baseline for Phase 4)
 ```
 
 ---
@@ -119,6 +131,12 @@ address space collapse.
                   AND locality: similar inputs → overlapping address prefixes
   Duration: ~5K steps
   Outcome: Stable, well-distributed, content-aware addresses.
+
+  Logging:
+    addr_entropy: X.XX         target > 7.0 (bits, out of 8.0 max)
+    depth_distribution_std: X.XX   (target: approximately uniform across 8 levels)
+    locality_correlation: X.XX     (similar inputs → overlapping address prefixes)
+    gumbel_temperature: X.XX       (annealing from 5.0 → 0.5)
 ```
 
 ---
@@ -149,11 +167,54 @@ address space collapse.
     Read trie → forward with memory → loss → generate write addresses → write
     Confidence gate + density signals provide gradient flow through memory path.
 
+  Trie during training:
+    Full L0 trie on GPU — same 256-ary structure, K=8 levels, as production.
+    AddrNet (frozen) generates hard addresses. Reads and writes hit the real trie.
+    Gradient flows through the continuous values stored in the trie:
+      trie stored value → mem_attn weights → LM loss
+    Confidence gate sees real structural density (populated_children counts).
+    
+    Training data volume is kept small so the trie stays GPU-resident.
+    Periodic trie resets bound memory growth and teach the model to rebuild
+    context from scratch — useful for inference robustness. Reset frequency is
+    determined by device memory budget and dataset size (reset when trie
+    approaches GPU memory limit).
+
+  Re-encounter training data (write_strength + confidence calibration):
+    Training sequences must include re-encounter patterns:
+    - Write fact X at step N → encounter same content again at step M > N
+    - At step M: trie node at that address is already populated (from halo or direct write)
+    - write_strength should be LOW → gentle nudge, accumulate without overwriting:
+        trie[addr] = (1 - α) × trie[addr] + α × new_value,  α = write_strength
+    - confidence gate should be HIGH → dense neighborhood = reliable data, attend strongly
+    write_strength and confidence gate are separate mechanisms:
+      write_strength = blend ratio for writes (low = nudge, high = overwrite)
+      confidence gate = read attention strength (dense = trust, sparse = uncertain)
+    Training data construction must include deliberate re-encounter sequences.
+
+  Training data constraint (critical):
+    The step order above means writes land in L0 at END of step N and are
+    readable at the START of step N+1. QA-pair sequences MUST be constructed
+    so that the write step precedes the read-back step by at least one step:
+      step N:   agent outputs write instruction → fact written to L0 at step end
+      step N+1: query requires reading that fact → found in L0 → retrieval loss computed
+    Constructing write and read-back in the same step will yield 0% retrieval
+    accuracy because L0 is read at the start of the same step (before the write).
+    This is a training data construction rule, not a code constraint.
+
   Gate criterion: Retrieval accuracy > 90%
                   AND LM loss with memory < LM loss without memory
                   AND confidence gate correlates with density (r > 0.7)
   Duration: ~15K steps
   Outcome: Working memory read/write. Calibrated confidence gate.
+
+  Logging:
+    retrieval_accuracy: X.XX%      target > 90%
+    lm_loss_with_memory: X.XXX     target < lm_loss_without_memory
+    confidence_density_corr: X.XX  target > 0.7
+    mem_attn_mean_abs: X.XXXX      target > 0.01 (if < 0.01 after 500 steps → warmup)
+    write_strength_mean: X.XX      (monitor for collapse to 0 or 1)
+    trie_node_count: XXXXX         (monitor GPU memory, reset when approaching limit)
 ```
 
 ---
@@ -178,9 +239,10 @@ address space collapse.
   Phase 5c — Unfreeze self-attention + FFN
     Train: all base components + all memory components
     Keep frozen: AddrNet (ALWAYS low LR after Phase 3)
-    LR: 0.1× for self-attn/FFN (prevent catastrophic forgetting)
-         0.5× for context/memory components
-         0.01× for AddrNet (minimal drift, or fully frozen)
+    LR base: Phase 4 final learning rate (from checkpoint['lr'])
+    LR: 0.1× base for self-attn/FFN (prevent catastrophic forgetting)
+         0.5× base for context/memory components
+         0.01× base for AddrNet (minimal drift, or fully frozen)
     Duration: ~5K steps
 
   Gate criterion: LM loss not degraded vs Phase 4
@@ -188,6 +250,11 @@ address space collapse.
                   AND no address distribution collapse
   Duration: ~15K steps total
   Outcome: Coherent model where all components cooperate.
+
+  Logging:
+    lm_loss: X.XXX             target <= phase4_final_lm_loss
+    retrieval_accuracy: X.XX%  target > 90%
+    addr_entropy: X.XX         target > 7.0 (no collapse during unfreeze)
 ```
 
 ---
@@ -249,6 +316,12 @@ address space collapse.
                   AND no hallucination increase in eval
   Duration: ~10K steps
   Outcome: Model understands partiality, calibrated imagination.
+
+  Logging:
+    partiality_loss: X.XXX         (asymmetric matching loss)
+    imagination_accuracy: X.XX%    target > 60%
+    confidence_density_corr: X.XX  target > 0.8
+    hallucination_rate: X.XX%      (monitor, no increase from Phase 5 baseline)
 ```
 
 ---
@@ -256,23 +329,29 @@ address space collapse.
 ## Phase 7 — Swarm Training (multi-agent coordination)
 
 ```
-  Goal:    Multi-agent coordination, peer context, scratchpad
+  Goal:    Multi-agent coordination, scratchpad-based communication
   Train:   Full model, AddrNet at very low LR (0.01×)
   Memory:  ON (full tiered, async)
   Data:    Long documents (multi-tile), chat, QA
   Method:
     1. Tile documents into N chunks, process as batch of N agents
-    2. Causal peer context flows via scratchpad + peer hiddens
+    2. All inter-agent communication flows via shared scratchpad (16 slots)
     3. All agents share same weights, different tiles
   Losses:
     a. LM loss per tile (each agent predicts next codes in its tile)
-    b. Peer utilization (reward agents that use peer context productively)
+    b. Scratchpad utilization (reward agents that use scratchpad productively)
     c. Scratchpad efficiency (minimize redundant writes)
     d. NOOP supervision (ingestion agents should output NOOP)
     e. Tool token accuracy (correct tool invocation format)
 
   Duration: ~20K steps
   Outcome: Working swarm with tile coordination.
+
+  Logging:
+    lm_loss_per_tile: X.XXX        (per-agent loss, should be comparable across tiles)
+    noop_rate: X.XX%               (should emerge naturally, ~1-5% in collaborative tasks)
+    scratchpad_utilization: X.XX   (fraction of 16 slots actively written per step)
+    multi_agent_coherence: X.XX    (cross-tile consistency metric)
 ```
 
 ---
@@ -288,6 +367,11 @@ address space collapse.
 
   Duration: ~10K steps
   Outcome: Deployment-ready chat agent.
+
+  Logging:
+    tool_dispatch_accuracy: X.XX%  (correct tool invocation format + selection)
+    chat_coherence: X.XX           (multi-turn consistency metric)
+    lm_loss: X.XXX                 (should not degrade from Phase 7)
 ```
 
 ---
@@ -309,6 +393,14 @@ Training data sources (HuggingFace + custom curation):
 
 All text data passes through the frozen Phase 1 VQ codec before use in Phases 2+.
 Core agents never see raw UTF-8 bytes.
+
+All training data across all phases includes NOOP filler tokens at natural pause points
+(~1-2% of positions). NOOP is a verbal filler ("ehm") — the model emits it when it needs
+more processing time. Maps to UTF-8 ACK at the Rust runtime boundary. Dataset construction
+places NOOP where complicated concepts or low-confidence reads would naturally cause a pause.
+
+Phase 4+ training data must include re-encounter sequences (same content written at step N,
+encountered again at step M > N) to calibrate write_strength and confidence gate.
 
 ---
 

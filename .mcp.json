@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "rust-analyzer": {
+      "command": "rust-analyzer-mcp"
+    },
+    "colab": {
+      "command": "uvx",
+      "args": ["git+https://github.com/googlecolab/colab-mcp"],
+      "timeout": 30000
+    },
+    "huggingface": {
+      "command": "uvx",
+      "args": ["huggingface-mcp-server"],
+      "env": {
+        "HF_TOKEN": "${HF_TOKEN}"
+      }
+    },
+    "github": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    }
+  }
+}

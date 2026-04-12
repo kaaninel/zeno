@@ -227,9 +227,10 @@ timestamp beyond threshold) signals a new work unit boundary.
   │       Model learns what to store (reasoning, partial state)  │
   │                                                              │
   │  3. RMSNorm → Unified Memory Cross-Attention → + residual    │
-  │     Attends to ALL sources in one pool:                      │
-  │       [L0 trie vectors] + [scratchpad slots]                 │
-  │       + [causal peer hiddens] + [async deep results]         │
+  │     Attends to ALL sources in one pool (22 slots fixed):     │
+  │       [3 L0 trie leaf vectors]                               │
+  │       + [16 shared scratchpad slots]                         │
+  │       + [3 async queue slots (FIFO, zero-masked if empty)]   │
   │     Per-head inv_temp for sharpness                          │
   │     Access cost loss (penalize expensive reads)              │
   │     Data quality loss (penalize attending to bad data)       │
@@ -314,6 +315,9 @@ timestamp beyond threshold) signals a new work unit boundary.
     Subtotal:                        2,129     0.3%
   Tag Encoder (~2K params):
     Mini cross-attn (1 layer, 2 heads) 2,048     0.3%
+    Note: text_encoder() in the tag pipeline = the VQ codec's byte encoder
+    (shared, frozen after Phase 1). The ~2K params here are ONLY the
+    cross-attention layer, not a separate encoder.
   Tag categorical embeds:
     status_embed(8×96)+method_embed(5×96) 1,248   0.2%
     null_vec + ephemeral_vec + indef_vec    288   0.0%
@@ -655,42 +659,20 @@ timestamp beyond threshold) signals a new work unit boundary.
    Temperature annealing. Address entropy monitoring. If addresses collapse,
    reduce bins (e.g., 64 bins × 8 levels = still 10^14 addresses).
 
-2. **Unified attention dilution (P0)**
-   With ~100+ slots from 4 different source types and only 4 heads at
-   d_model=96, attention may spread too thin. The model must learn to
-   distinguish "this is a trie vector" from "this is a peer hidden" from
-   "this is a scratchpad slot" — all in the same attention computation.
-   
-   Mitigation: Access cost loss forces model to focus. Source-type positional
-   encoding (add a learned "source tag" embedding to each slot). If still
-   diluted, fall back to head specialization.
+2. **Unified attention dilution (RESOLVED)**
+   Pool fixed at 22 slots (3 trie + 16 scratchpad + 3 async queue). 4 heads × ~5 keys
+   each. No dilution. "Causal peer hiddens" dropped — scratchpad is the only inter-agent
+   channel. Fixed slot ordering lets attention heads specialize by position.
 
 3. **250K TPS generation target (P1)**
-   250K TPS for autoregressive generation is extremely ambitious. Each
-   generated token requires a full forward pass + memory read + write.
-   
-   Math: d=96, 4 layers, single token → ~1M FLOPs → ~0.06μs compute.
-   But overhead (memory transport, tensor alloc, kernel launch) likely
-   adds 10-50μs per token. Realistic per-agent: ~20-50K TPS.
-   
-   With 8 parallel agents doing speculative generation: ~160-400K TPS
-   throughput. Achievable, but requires batch-level parallelism, not
-   single-request speed.
-   
-   Clarification needed: Is 250K TPS total throughput (across concurrent
-   requests) or per-request latency?
+   250K TPS = **total swarm throughput** across concurrent requests, not per-request latency.
+   Single agent DRAM ceiling on M4: ~90K tok/s. ANE SRAM-cached: ~1.9M tok/s for 18+ agents.
+   250K TPS achievable with ~13 concurrent ANE-cached agents on one M4 base. See EXPECTATIONS.md.
 
-4. **Training in pure Rust / candle (P1)**
-   candle supports training but the ecosystem is young. Missing:
-   - Sophisticated data loaders (no equivalent of PyTorch DataLoader)
-   - Limited optimizer variety (Adam/SGD, but no AdamW scheduling tricks)
-   - Debugging is harder (no Python REPL, no easy tensor inspection)
-   - Gumbel-softmax may need custom implementation
-   - Gradient clipping, mixed precision less mature
-   
-   Mitigation: Start with candle for inference, keep PyTorch for training
-   initially. Migrate training to candle once inference is proven.
-   OR: Accept the development cost, build missing pieces in Rust.
+4. **Training in pure Rust / candle (RESOLVED)**
+   **Candle-only for all training and inference.** We accept the development cost. Missing
+   pieces (DataLoader, Gumbel-softmax, custom schedules) will be built in Rust. See TRAINING.md.
+   The model is small enough (666K params) that candle's training limitations are manageable.
 
 5. **Text VQ reconstruction fidelity (P0)**
    Exact round-trip UTF-8 reconstruction from VQ codes is the hardest

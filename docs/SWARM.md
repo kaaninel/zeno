@@ -379,12 +379,21 @@ and tool dispatch.
 ## Shared Scratchpad
 
 ```
-  Fixed 16 × d_model tensor on GPU, shared by all agents.
+  Fixed 16 × d_model tensor on GPU, shared by all agents in a work group.
+  Scratchpad DEFINES the work group: agents sharing a scratchpad are in the same
+  work group (analogous to GPU SMEM defining a thread block). Agents in different
+  work groups cannot communicate.
 
-  Access pattern:
-    - Agents READ scratchpad at start of each chunk
-    - Agents WRITE scratchpad at end of each chunk
-    - Concurrent writes: additive/EMA blending
+  Work group size: dynamic, 1–N_max agents. N_max is configurable at launch
+  (supports up to 128+ agents for large tasks). Only active agents participate
+  in the scratchpad update.
+
+  Update mechanism:
+    - Each agent applies a small FFN to its hidden state → per-slot (value, strength)
+    - Strength-weighted mean applied across all agents simultaneously:
+        scratchpad[i] = Σ_a(strength[a][i] × value[a][i]) / Σ_a(strength[a][i])
+    - Fully parallel, no atomics, fully differentiable
+    - Automatic: every agent contributes every step (strength gates actual influence)
 
   Uses:
     - Inter-tile coherence (edge hidden states between image quadrants)
@@ -395,9 +404,4 @@ and tool dispatch.
   Lifecycle:
     - Resets between unrelated work groups
     - Persists within a work group (e.g., one image's spatial tiles)
-
-  Conflict resolution:
-    - Atomic f32 adds on GPU for concurrent writes
-    - Or: per-agent owned slots (ring buffer) with all-read access
-    - N agents × 16 slots — model learns which slots to use
 ```
