@@ -1,10 +1,89 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::config::ZenoConfig;
 use crate::data::ByteDataset;
 use crate::model::{ForwardOutput, RingBuffer, ZenoAgent};
 use crate::trie::ProtoTrie;
+
+// ---------------------------------------------------------------------------
+// Shared training infrastructure
+// ---------------------------------------------------------------------------
+
+/// Checkpoint configuration shared across all phases.
+pub struct CheckpointConfig {
+    /// Directory to save checkpoints in (None = no checkpoints)
+    pub checkpoint_dir: Option<PathBuf>,
+    /// Save checkpoint every N steps (0 = only at phase end)
+    pub checkpoint_every: usize,
+    /// Interrupt flag — set by Ctrl+C handler
+    pub interrupted: Arc<AtomicBool>,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            checkpoint_dir: None,
+            checkpoint_every: 0,
+            interrupted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Save a checkpoint to disk.
+fn save_checkpoint(varmap: &VarMap, dir: &Path, label: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{label}.safetensors"));
+    varmap.save(&path)?;
+    println!("  💾 Saved checkpoint: {}", path.display());
+    Ok(())
+}
+
+/// Check if training should stop (interrupted flag set).
+fn should_stop(ckpt: &CheckpointConfig) -> bool {
+    ckpt.interrupted.load(Ordering::Relaxed)
+}
+
+/// Gradient-clipped optimizer step.
+///
+/// Computes backward pass, measures global gradient norm, and if it exceeds
+/// `max_norm`, scales gradients down proportionally before applying the update.
+///
+/// Returns the gradient norm (before clipping).
+fn clipped_backward_step(
+    loss: &Tensor,
+    opt: &mut AdamW,
+    varmap: &VarMap,
+    max_norm: f64,
+) -> candle_core::Result<f64> {
+    let grads = loss.backward()?;
+
+    // Compute global gradient norm
+    let vars = varmap.all_vars();
+    let mut total_norm_sq = 0f64;
+    for var in &vars {
+        if let Some(grad) = grads.get(var.as_tensor()) {
+            let n: f32 = grad.sqr()?.sum_all()?.to_scalar()?;
+            total_norm_sq += n as f64;
+        }
+    }
+    let total_norm = total_norm_sq.sqrt();
+
+    if total_norm > max_norm && max_norm > 0.0 {
+        // Scale loss so gradients are proportionally reduced
+        let scale = max_norm / (total_norm + 1e-8);
+        let scaled_loss = (loss * scale)?;
+        let clipped_grads = scaled_loss.backward()?;
+        opt.step(&clipped_grads)?;
+    } else {
+        opt.step(&grads)?;
+    }
+
+    Ok(total_norm)
+}
 
 /// Filter VarMap variables by name prefixes, returning only matching Vars.
 fn filter_vars(varmap: &VarMap, prefixes: &[String]) -> Vec<candle_core::Var> {
@@ -35,6 +114,7 @@ pub struct Phase2Config {
     pub batch_size: usize,
     pub log_every: usize,
     pub gate_loss: f64, // target: loss < 3.0
+    pub max_grad_norm: f64,
 }
 
 impl Default for Phase2Config {
@@ -45,6 +125,7 @@ impl Default for Phase2Config {
             batch_size: 4,
             log_every: 100,
             gate_loss: 3.0,
+            max_grad_norm: 1.0,
         }
     }
 }
@@ -55,10 +136,11 @@ pub fn train_phase2(
     dataset: &ByteDataset,
     cfg: &ZenoConfig,
     pcfg: &Phase2Config,
+    ckpt: &CheckpointConfig,
     device: &Device,
 ) -> anyhow::Result<f64> {
     println!("=== Phase 2: Base Language Model ===");
-    println!("  lr={}, steps={}, batch={}", pcfg.lr, pcfg.steps, pcfg.batch_size);
+    println!("  lr={}, steps={}, batch={}, grad_clip={}", pcfg.lr, pcfg.steps, pcfg.batch_size, pcfg.max_grad_norm);
     println!("  Gate: loss < {:.1}", pcfg.gate_loss);
 
     let prefixes = agent.phase2_params();
@@ -79,12 +161,18 @@ pub fn train_phase2(
     let mut best_loss = f64::MAX;
 
     for step in 1..=pcfg.steps {
+        if should_stop(ckpt) {
+            println!("  ⚠ Interrupted at step {}", step);
+            save_checkpoint(varmap, ckpt.checkpoint_dir.as_deref().unwrap_or(Path::new("checkpoints")), "phase2_interrupt")?;
+            break;
+        }
+
         let (input, target) = dataset.get_random_batch(pcfg.batch_size, device)?;
 
         let out: ForwardOutput = agent.forward(&input, &trie, &ring, 1.0, false, device)?;
         let loss = compute_lm_loss(&out.logits, &target)?;
 
-        opt.backward_step(&loss)?;
+        let _grad_norm = clipped_backward_step(&loss, &mut opt, varmap, pcfg.max_grad_norm)?;
 
         let loss_val: f64 = loss.to_scalar::<f32>()? as f64;
         running_loss += loss_val;
@@ -107,6 +195,18 @@ pub fn train_phase2(
             running_loss = 0.0;
             running_count = 0;
         }
+
+        // Periodic checkpoint
+        if ckpt.checkpoint_every > 0 && step % ckpt.checkpoint_every == 0 {
+            if let Some(ref dir) = ckpt.checkpoint_dir {
+                save_checkpoint(varmap, dir, &format!("phase2_step{step}"))?;
+            }
+        }
+    }
+
+    // End-of-phase checkpoint
+    if let Some(ref dir) = ckpt.checkpoint_dir {
+        save_checkpoint(varmap, dir, "phase2_final")?;
     }
 
     println!("  Phase 2 complete. Best loss={:.4}", best_loss);
@@ -131,6 +231,7 @@ pub struct Phase3Config {
     pub tau_start: f64,
     pub tau_end: f64,
     pub gate_entropy: f64, // target: entropy > 7.0
+    pub max_grad_norm: f64,
 }
 
 impl Default for Phase3Config {
@@ -143,6 +244,7 @@ impl Default for Phase3Config {
             tau_start: 5.0,
             tau_end: 0.5,
             gate_entropy: 7.0,
+            max_grad_norm: 1.0,
         }
     }
 }
@@ -214,10 +316,11 @@ pub fn train_phase3(
     dataset: &ByteDataset,
     cfg: &ZenoConfig,
     pcfg: &Phase3Config,
+    ckpt: &CheckpointConfig,
     device: &Device,
 ) -> anyhow::Result<f64> {
     println!("=== Phase 3: AddrNet Training ===");
-    println!("  lr={}, steps={}, τ: {}→{}", pcfg.lr, pcfg.steps, pcfg.tau_start, pcfg.tau_end);
+    println!("  lr={}, steps={}, τ: {}→{}, grad_clip={}", pcfg.lr, pcfg.steps, pcfg.tau_start, pcfg.tau_end, pcfg.max_grad_norm);
     println!("  Gate: address entropy > {:.1}", pcfg.gate_entropy);
 
     let prefixes = agent.phase3_params();
@@ -236,6 +339,12 @@ pub fn train_phase3(
     let mut best_entropy = 0.0;
 
     for step in 1..=pcfg.steps {
+        if should_stop(ckpt) {
+            println!("  ⚠ Interrupted at step {}", step);
+            save_checkpoint(varmap, ckpt.checkpoint_dir.as_deref().unwrap_or(Path::new("checkpoints")), "phase3_interrupt")?;
+            break;
+        }
+
         let progress = step as f64 / pcfg.steps as f64;
         let tau = pcfg.tau_start + (pcfg.tau_end - pcfg.tau_start) * progress;
 
@@ -254,7 +363,7 @@ pub fn train_phase3(
         // Combined loss: entropy (neg, minimize) + diversity penalty
         let total_loss = (entropy_loss + div_loss)?;
 
-        opt.backward_step(&total_loss)?;
+        let _grad_norm = clipped_backward_step(&total_loss, &mut opt, varmap, pcfg.max_grad_norm)?;
 
         if avg_entropy > best_entropy {
             best_entropy = avg_entropy;
@@ -272,6 +381,16 @@ pub fn train_phase3(
                 if avg_entropy > pcfg.gate_entropy { " ✓ GATE" } else { "" }
             );
         }
+
+        if ckpt.checkpoint_every > 0 && step % ckpt.checkpoint_every == 0 {
+            if let Some(ref dir) = ckpt.checkpoint_dir {
+                save_checkpoint(varmap, dir, &format!("phase3_step{step}"))?;
+            }
+        }
+    }
+
+    if let Some(ref dir) = ckpt.checkpoint_dir {
+        save_checkpoint(varmap, dir, "phase3_final")?;
     }
 
     println!("  Phase 3 complete. Best entropy={:.2}", best_entropy);
@@ -296,6 +415,7 @@ pub struct Phase4Config {
     pub tau: f64,
     pub gate_retrieval: f64,   // target: > 0.9
     pub eval_every: usize,     // how often to run re-encounter eval
+    pub max_grad_norm: f64,
 }
 
 impl Default for Phase4Config {
@@ -308,6 +428,7 @@ impl Default for Phase4Config {
             tau: 0.5,
             eval_every: 1000,
             gate_retrieval: 0.9,
+            max_grad_norm: 1.0,
         }
     }
 }
@@ -404,10 +525,11 @@ pub fn train_phase4(
     dataset: &ByteDataset,
     cfg: &ZenoConfig,
     pcfg: &Phase4Config,
+    ckpt: &CheckpointConfig,
     device: &Device,
 ) -> anyhow::Result<f64> {
     println!("=== Phase 4: Memory Integration ===");
-    println!("  lr={}, steps={}, τ={}", pcfg.lr, pcfg.steps, pcfg.tau);
+    println!("  lr={}, steps={}, τ={}, grad_clip={}", pcfg.lr, pcfg.steps, pcfg.tau, pcfg.max_grad_norm);
     println!("  Gate: re-encounter improvement > {:.0}%", pcfg.gate_retrieval * 100.0);
 
     let prefixes = agent.phase4_params();
@@ -428,13 +550,19 @@ pub fn train_phase4(
     let mut best_improvement = 0.0;
 
     for step in 1..=pcfg.steps {
+        if should_stop(ckpt) {
+            println!("  ⚠ Interrupted at step {}", step);
+            save_checkpoint(varmap, ckpt.checkpoint_dir.as_deref().unwrap_or(Path::new("checkpoints")), "phase4_interrupt")?;
+            break;
+        }
+
         let (input, target) = dataset.get_random_batch(pcfg.batch_size, device)?;
 
         // Forward with memory
         let out = agent.forward(&input, &trie, &ring, pcfg.tau, true, device)?;
         let loss = compute_lm_loss(&out.logits, &target)?;
 
-        opt.backward_step(&loss)?;
+        let _grad_norm = clipped_backward_step(&loss, &mut opt, varmap, pcfg.max_grad_norm)?;
 
         // Perform trie writes (after gradient step, detached)
         perform_trie_writes(&out, &mut trie, cfg)?;
@@ -473,10 +601,21 @@ pub fn train_phase4(
             }
         }
 
+        // Periodic checkpoint
+        if ckpt.checkpoint_every > 0 && step % ckpt.checkpoint_every == 0 {
+            if let Some(ref dir) = ckpt.checkpoint_dir {
+                save_checkpoint(varmap, dir, &format!("phase4_step{step}"))?;
+            }
+        }
+
         // Reset trie periodically to prevent unbounded growth
         if trie.len() > 50_000 {
             trie.reset();
         }
+    }
+
+    if let Some(ref dir) = ckpt.checkpoint_dir {
+        save_checkpoint(varmap, dir, "phase4_final")?;
     }
 
     println!("  Phase 4 complete. Best improvement={:.1}%", best_improvement * 100.0);
@@ -500,6 +639,7 @@ pub struct Phase5Config {
     pub batch_size: usize,
     pub log_every: usize,
     pub tau: f64,
+    pub max_grad_norm: f64,
 }
 
 impl Default for Phase5Config {
@@ -511,6 +651,7 @@ impl Default for Phase5Config {
             batch_size: 4,
             log_every: 100,
             tau: 0.5,
+            max_grad_norm: 1.0,
         }
     }
 }
@@ -527,6 +668,8 @@ fn train_phase5_sub(
     batch_size: usize,
     log_every: usize,
     tau: f64,
+    max_grad_norm: f64,
+    ckpt: &CheckpointConfig,
     device: &Device,
 ) -> anyhow::Result<f64> {
     println!("  --- Phase 5{} ---", label);
@@ -547,11 +690,17 @@ fn train_phase5_sub(
     let mut best_loss = f64::MAX;
 
     for step in 1..=steps {
+        if should_stop(ckpt) {
+            println!("    ⚠ Interrupted at step {}", step);
+            save_checkpoint(varmap, ckpt.checkpoint_dir.as_deref().unwrap_or(Path::new("checkpoints")), &format!("phase5{label}_interrupt"))?;
+            break;
+        }
+
         let (input, target) = dataset.get_random_batch(batch_size, device)?;
         let out = agent.forward(&input, &trie, &ring, tau, true, device)?;
         let loss = compute_lm_loss(&out.logits, &target)?;
 
-        opt.backward_step(&loss)?;
+        let _grad_norm = clipped_backward_step(&loss, &mut opt, varmap, max_grad_norm)?;
         perform_trie_writes(&out, &mut trie, cfg)?;
 
         let loss_val: f64 = loss.to_scalar::<f32>()? as f64;
@@ -582,6 +731,7 @@ pub fn train_phase5(
     dataset: &ByteDataset,
     cfg: &ZenoConfig,
     pcfg: &Phase5Config,
+    ckpt: &CheckpointConfig,
     device: &Device,
 ) -> anyhow::Result<f64> {
     println!("=== Phase 5: Coherence Unfreeze ===");
@@ -601,8 +751,11 @@ pub fn train_phase5(
         "a (mem_attn + write heads)",
         agent, varmap, dataset, cfg,
         &p5a, pcfg.lr_base, pcfg.steps_per_sub,
-        pcfg.batch_size, pcfg.log_every, pcfg.tau, device,
+        pcfg.batch_size, pcfg.log_every, pcfg.tau,
+        pcfg.max_grad_norm, ckpt, device,
     )?;
+
+    if should_stop(ckpt) { return Ok(loss_5a); }
 
     // 5b: unfreeze context cross-attention
     let mut p5b = p5a.clone();
@@ -614,8 +767,11 @@ pub fn train_phase5(
         "b (+ context cross-attn)",
         agent, varmap, dataset, cfg,
         &p5b, pcfg.lr_base, pcfg.steps_per_sub,
-        pcfg.batch_size, pcfg.log_every, pcfg.tau, device,
+        pcfg.batch_size, pcfg.log_every, pcfg.tau,
+        pcfg.max_grad_norm, ckpt, device,
     )?;
+
+    if should_stop(ckpt) { return Ok(loss_5b); }
 
     // 5c: unfreeze self-attn + FFN at 0.1× LR, AddrNet at 0.01×
     // First: self-attn + FFN at reduced LR
@@ -634,8 +790,11 @@ pub fn train_phase5(
         "c (self-attn + FFN at 0.1×)",
         agent, varmap, dataset, cfg,
         &p5c, pcfg.lr_base * 0.1, pcfg.steps_per_sub,
-        pcfg.batch_size, pcfg.log_every, pcfg.tau, device,
+        pcfg.batch_size, pcfg.log_every, pcfg.tau,
+        pcfg.max_grad_norm, ckpt, device,
     )?;
+
+    if should_stop(ckpt) { return Ok(loss_5c_base); }
 
     // Then: AddrNet at 0.01× LR
     let p5c_addr = vec!["addr_nets".to_string()];
@@ -643,8 +802,13 @@ pub fn train_phase5(
         "c (AddrNet at 0.01×)",
         agent, varmap, dataset, cfg,
         &p5c_addr, pcfg.lr_base * pcfg.lr_addr_multiplier, pcfg.steps_per_sub / 2,
-        pcfg.batch_size, pcfg.log_every, pcfg.tau, device,
+        pcfg.batch_size, pcfg.log_every, pcfg.tau,
+        pcfg.max_grad_norm, ckpt, device,
     )?;
+
+    if let Some(ref dir) = ckpt.checkpoint_dir {
+        save_checkpoint(varmap, dir, "phase5_final")?;
+    }
 
     println!("  Phase 5 complete. Losses: 5a={:.4} 5b={:.4} 5c_base={:.4} 5c_addr={:.4}",
         loss_5a, loss_5b, loss_5c_base, loss_5c_addr);

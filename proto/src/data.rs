@@ -36,17 +36,37 @@ pub struct ByteDataset {
 }
 
 impl ByteDataset {
-    /// Scan `dir` for text files, chunk them into `context_window`-byte windows.
+    /// Scan `dir` recursively for text files, chunk them into `context_window`-byte windows.
     pub fn from_directory(dir: &Path, context_window: usize) -> Result<Self> {
         if !dir.is_dir() {
             bail!("{} is not a directory", dir.display());
         }
 
         let mut chunks = Vec::new();
+        Self::scan_directory(dir, context_window, &mut chunks)?;
 
+        let mut rng = rand::thread_rng();
+        chunks.shuffle(&mut rng);
+
+        Ok(Self {
+            chunks,
+            context_window,
+        })
+    }
+
+    /// Merge another dataset into this one.
+    pub fn merge(&mut self, other: Self) {
+        self.chunks.extend(other.chunks);
+    }
+
+    fn scan_directory(dir: &Path, context_window: usize, chunks: &mut Vec<Vec<u8>>) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+            if path.is_dir() {
+                Self::scan_directory(&path, context_window, chunks)?;
+                continue;
+            }
             if !path.is_file() {
                 continue;
             }
@@ -66,16 +86,9 @@ impl ByteDataset {
             let header = make_header(filename, dtype);
 
             let data = fs::read(&path)?;
-            Self::chunk_with_header(&data, &header, context_window, &mut chunks);
+            Self::chunk_with_header(&data, &header, context_window, chunks);
         }
-
-        let mut rng = rand::thread_rng();
-        chunks.shuffle(&mut rng);
-
-        Ok(Self {
-            chunks,
-            context_window,
-        })
+        Ok(())
     }
 
     /// Create chunks from a single byte stream with explicit metadata.

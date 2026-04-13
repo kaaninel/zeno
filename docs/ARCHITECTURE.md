@@ -221,11 +221,10 @@ timestamp beyond threshold) signals a new work unit boundary.
   │     Unified pool of 14 slots:                                │
   │       [10 tag vectors from Tag Encoder (side-channel)]       │
   │       + [4 register slots (general-purpose internal state)]  │
-  │     Register bank: 4×d_model, GRU-gated, reset per unit      │
-  │       Read-then-update: cross-attend to CURRENT register,    │
-  │       THEN GRU updates register from enriched hidden state.  │
-  │       Next token reads updated register.                     │
-  │       Model learns what to store (reasoning, partial state)  │
+  │     Register bank: 4×d_model FIFO ring buffer, reset per unit   │
+  │       Each token: push current hidden to ring, oldest drops.   │
+  │       Cross-attention handles selection from last 4 hiddens.   │
+  │       Zero-init empty slots until ring fills (first 3 tokens). │
   │                                                              │
   │  3. RMSNorm → Unified Memory Cross-Attention → + residual    │
   │     Attends to ALL sources in one pool (22 slots fixed):     │

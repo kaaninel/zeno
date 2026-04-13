@@ -2,11 +2,13 @@ use anyhow::{bail, Result};
 use candle_core::{DType, Device};
 use candle_nn::{VarBuilder, VarMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use zeno_proto::config::ZenoConfig;
 use zeno_proto::data::ByteDataset;
 use zeno_proto::model::ZenoAgent;
-use zeno_proto::train;
+use zeno_proto::train::{self, CheckpointConfig};
 
 fn select_device() -> Result<Device> {
     #[cfg(feature = "cuda")]
@@ -31,18 +33,20 @@ fn print_usage() {
     println!("Zeno Prototype 1 — Core Agent + Trie Memory PoC");
     println!();
     println!("Usage:");
-    println!("  zeno-proto train --phase <2|3|4|5> [--data-dir <path>] [--steps <N>] [--lr <F>]");
-    println!("  zeno-proto train-all [--data-dir <path>]");
-    println!("  zeno-proto eval [--data-dir <path>] [--memory]");
+    println!("  zeno-proto train --phase <2|3|4|5> [options]");
+    println!("  zeno-proto train-all [options]");
+    println!("  zeno-proto eval [--data-dir <path>] [--memory] [--load <path>]");
     println!("  zeno-proto info");
     println!();
     println!("Options:");
-    println!("  --data-dir <path>  Directory with training text files (default: ../docs)");
-    println!("  --steps <N>        Override step count for the phase");
-    println!("  --lr <F>           Override learning rate");
-    println!("  --memory           Enable memory for evaluation");
-    println!("  --save <path>      Save model weights after training");
-    println!("  --load <path>      Load model weights before training/eval");
+    println!("  --data-dir <path>         Training text files directory (default: data)");
+    println!("  --steps <N>               Override step count for the phase");
+    println!("  --lr <F>                  Override learning rate");
+    println!("  --memory                  Enable memory for evaluation");
+    println!("  --save <path>             Save model weights after training");
+    println!("  --load <path>             Load model weights before training/eval");
+    println!("  --checkpoint-dir <path>   Directory for periodic checkpoints (default: checkpoints)");
+    println!("  --checkpoint-every <N>    Save checkpoint every N steps (0 = phase end only)");
 }
 
 fn parse_args() -> Result<CliArgs> {
@@ -57,12 +61,14 @@ fn parse_args() -> Result<CliArgs> {
     let mut cli = CliArgs {
         command: command.to_string(),
         phase: None,
-        data_dir: PathBuf::from("../docs"),
+        data_dir: PathBuf::from("data"),
         steps: None,
         lr: None,
         use_memory: false,
         save_path: None,
         load_path: None,
+        checkpoint_dir: PathBuf::from("checkpoints"),
+        checkpoint_every: 1000,
     };
 
     let mut i = 2;
@@ -95,6 +101,14 @@ fn parse_args() -> Result<CliArgs> {
                 i += 1;
                 cli.load_path = Some(PathBuf::from(&args[i]));
             }
+            "--checkpoint-dir" => {
+                i += 1;
+                cli.checkpoint_dir = PathBuf::from(&args[i]);
+            }
+            "--checkpoint-every" => {
+                i += 1;
+                cli.checkpoint_every = args[i].parse()?;
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -118,12 +132,28 @@ struct CliArgs {
     use_memory: bool,
     save_path: Option<PathBuf>,
     load_path: Option<PathBuf>,
+    checkpoint_dir: PathBuf,
+    checkpoint_every: usize,
 }
 
 fn main() -> Result<()> {
     let cli = parse_args()?;
     let device = select_device()?;
     let cfg = ZenoConfig::default_proto();
+
+    // Set up Ctrl+C handler
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_clone = interrupted.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("\n⚠ Interrupt received — saving checkpoint and exiting...");
+        interrupted_clone.store(true, Ordering::Relaxed);
+    }).expect("Failed to set Ctrl+C handler");
+
+    let ckpt = CheckpointConfig {
+        checkpoint_dir: Some(cli.checkpoint_dir.clone()),
+        checkpoint_every: cli.checkpoint_every,
+        interrupted: interrupted.clone(),
+    };
 
     // Create model
     let mut varmap = VarMap::new();
@@ -160,25 +190,25 @@ fn main() -> Result<()> {
                     let mut pcfg = train::Phase2Config::default();
                     if let Some(steps) = cli.steps { pcfg.steps = steps; }
                     if let Some(lr) = cli.lr { pcfg.lr = lr; }
-                    train::train_phase2(&agent, &varmap, &dataset, &cfg, &pcfg, &device)?;
+                    train::train_phase2(&agent, &varmap, &dataset, &cfg, &pcfg, &ckpt, &device)?;
                 }
                 3 => {
                     let mut pcfg = train::Phase3Config::default();
                     if let Some(steps) = cli.steps { pcfg.steps = steps; }
                     if let Some(lr) = cli.lr { pcfg.lr = lr; }
-                    train::train_phase3(&agent, &varmap, &dataset, &cfg, &pcfg, &device)?;
+                    train::train_phase3(&agent, &varmap, &dataset, &cfg, &pcfg, &ckpt, &device)?;
                 }
                 4 => {
                     let mut pcfg = train::Phase4Config::default();
                     if let Some(steps) = cli.steps { pcfg.steps = steps; }
                     if let Some(lr) = cli.lr { pcfg.lr = lr; }
-                    train::train_phase4(&agent, &varmap, &dataset, &cfg, &pcfg, &device)?;
+                    train::train_phase4(&agent, &varmap, &dataset, &cfg, &pcfg, &ckpt, &device)?;
                 }
                 5 => {
                     let mut pcfg = train::Phase5Config::default();
                     if let Some(lr) = cli.lr { pcfg.lr_base = lr; }
                     if let Some(steps) = cli.steps { pcfg.steps_per_sub = steps; }
-                    train::train_phase5(&agent, &varmap, &dataset, &cfg, &pcfg, &device)?;
+                    train::train_phase5(&agent, &varmap, &dataset, &cfg, &pcfg, &ckpt, &device)?;
                 }
                 _ => bail!("Invalid phase: {}. Use 2, 3, 4, or 5.", phase),
             }
@@ -195,22 +225,34 @@ fn main() -> Result<()> {
 
             let mut p2cfg = train::Phase2Config::default();
             if let Some(steps) = cli.steps { p2cfg.steps = steps; }
-            train::train_phase2(&agent, &varmap, &dataset, &cfg, &p2cfg, &device)?;
+            train::train_phase2(&agent, &varmap, &dataset, &cfg, &p2cfg, &ckpt, &device)?;
+            if interrupted.load(Ordering::Relaxed) {
+                println!("\nTraining interrupted after Phase 2.");
+                return Ok(());
+            }
             println!();
 
             let mut p3cfg = train::Phase3Config::default();
             if let Some(steps) = cli.steps { p3cfg.steps = steps; }
-            train::train_phase3(&agent, &varmap, &dataset, &cfg, &p3cfg, &device)?;
+            train::train_phase3(&agent, &varmap, &dataset, &cfg, &p3cfg, &ckpt, &device)?;
+            if interrupted.load(Ordering::Relaxed) {
+                println!("\nTraining interrupted after Phase 3.");
+                return Ok(());
+            }
             println!();
 
             let mut p4cfg = train::Phase4Config::default();
             if let Some(steps) = cli.steps { p4cfg.steps = steps; }
-            train::train_phase4(&agent, &varmap, &dataset, &cfg, &p4cfg, &device)?;
+            train::train_phase4(&agent, &varmap, &dataset, &cfg, &p4cfg, &ckpt, &device)?;
+            if interrupted.load(Ordering::Relaxed) {
+                println!("\nTraining interrupted after Phase 4.");
+                return Ok(());
+            }
             println!();
 
             let mut p5cfg = train::Phase5Config::default();
             if let Some(steps) = cli.steps { p5cfg.steps_per_sub = steps; }
-            train::train_phase5(&agent, &varmap, &dataset, &cfg, &p5cfg, &device)?;
+            train::train_phase5(&agent, &varmap, &dataset, &cfg, &p5cfg, &ckpt, &device)?;
 
             if let Some(ref path) = cli.save_path {
                 println!("\nSaving weights to {}", path.display());
