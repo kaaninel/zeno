@@ -843,12 +843,8 @@ fn address_entropy_loss(logits_list: &[Tensor]) -> candle_core::Result<(Tensor, 
 }
 
 fn last_token_logits(logits: &Tensor) -> candle_core::Result<Tensor> {
-    let (batch, seq_len, _depth, _arity) = logits.dims4()?;
-    let mut rows = Vec::with_capacity(batch);
-    for batch_index in 0..batch {
-        rows.push(logits.get(batch_index)?.get(seq_len - 1)?);
-    }
-    Tensor::stack(&rows, 0)
+    let (_batch, seq_len, _depth, _arity) = logits.dims4()?;
+    logits.narrow(1, seq_len - 1, 1)?.squeeze(1)
 }
 
 fn shared_prefix_ratio(left: &[u32], right: &[u32]) -> f64 {
@@ -865,19 +861,30 @@ fn prefix_match_scores(
     probs_a: &Tensor,
     probs_b: &Tensor,
 ) -> candle_core::Result<(Tensor, Tensor)> {
-    let depth = probs_a.dim(0)?;
-    let device = probs_a.device();
-    let mut prefix_product = Tensor::ones((), DType::F32, device)?;
-    let mut prefix_sum = Tensor::zeros((), DType::F32, device)?;
+    let match_probs = (probs_a * probs_b)?.sum(candle_core::D::Minus1)?;
+    let dims = match_probs.dims();
+    let depth_axis = dims.len().saturating_sub(1);
+    let depth = dims[depth_axis];
+    let mut prefix_product: Option<Tensor> = None;
+    let mut prefix_sum: Option<Tensor> = None;
 
     for depth_index in 0..depth {
-        let level_a = probs_a.get(depth_index)?;
-        let level_b = probs_b.get(depth_index)?;
-        let match_prob = (&level_a * &level_b)?.sum_all()?;
-        prefix_product = (&prefix_product * &match_prob)?;
-        prefix_sum = (prefix_sum + &prefix_product)?;
+        let match_prob = match_probs
+            .narrow(depth_axis, depth_index, 1)?
+            .squeeze(depth_axis)?;
+        let next_prefix = match &prefix_product {
+            Some(current) => (current * &match_prob)?,
+            None => match_prob,
+        };
+        prefix_sum = Some(match &prefix_sum {
+            Some(current) => (current + &next_prefix)?,
+            None => next_prefix.clone(),
+        });
+        prefix_product = Some(next_prefix);
     }
 
+    let prefix_product = prefix_product.unwrap();
+    let prefix_sum = prefix_sum.unwrap();
     Ok(((prefix_sum / depth as f64)?, prefix_product))
 }
 
@@ -929,7 +936,6 @@ fn address_depth_usage_loss(write_logits: &[Tensor]) -> candle_core::Result<(Ten
     }
 
     let device = write_logits[0].device();
-    let one = Tensor::ones((), DType::F32, device)?;
     let mut loss_sum = Tensor::zeros((), DType::F32, device)?;
     let mut novelty_total = 0.0;
     let mut count = 0usize;
@@ -938,15 +944,15 @@ fn address_depth_usage_loss(write_logits: &[Tensor]) -> candle_core::Result<(Ten
         let final_probs =
             candle_nn::ops::softmax(&last_token_logits(logits)?, candle_core::D::Minus1)?;
         let (batch, depth, _arity) = final_probs.dims3()?;
-        for batch_index in 0..batch {
-            let sample = final_probs.get(batch_index)?;
-            for depth_index in 1..depth {
-                let novelty = (&one
-                    - (&sample.get(depth_index - 1)? * &sample.get(depth_index)?)?.sum_all()?)?;
-                loss_sum = (loss_sum - &novelty)?;
-                novelty_total += novelty.to_scalar::<f32>()? as f64;
-                count += 1;
-            }
+        for depth_index in 1..depth {
+            let prev = final_probs.narrow(1, depth_index - 1, 1)?.squeeze(1)?;
+            let next = final_probs.narrow(1, depth_index, 1)?.squeeze(1)?;
+            let match_probs = (&prev * &next)?.sum(candle_core::D::Minus1)?;
+            let novelty = (Tensor::ones_like(&match_probs)? - &match_probs)?;
+            let novelty_sum = novelty.sum_all()?;
+            loss_sum = (loss_sum - &novelty_sum)?;
+            novelty_total += novelty_sum.to_scalar::<f32>()? as f64;
+            count += batch;
         }
     }
 
@@ -972,23 +978,17 @@ fn address_diversity_loss(addr_logits: &[Tensor]) -> candle_core::Result<(Tensor
         .map(|logits| candle_nn::ops::softmax(&logits, candle_core::D::Minus1))
         .collect::<candle_core::Result<Vec<_>>>()?;
 
-    let batch = final_probs[0].dim(0)?;
     let mut loss_sum = Tensor::zeros((), DType::F32, device)?;
     let mut overlap_total = 0.0;
     let mut pair_count = 0usize;
 
-    for batch_index in 0..batch {
-        for i in 0..final_probs.len() {
-            for j in (i + 1)..final_probs.len() {
-                let score = prefix_match_scores(
-                    &final_probs[i].get(batch_index)?,
-                    &final_probs[j].get(batch_index)?,
-                )?
-                .0;
-                loss_sum = (loss_sum + &score)?;
-                overlap_total += score.to_scalar::<f32>()? as f64;
-                pair_count += 1;
-            }
+    for i in 0..final_probs.len() {
+        for j in (i + 1)..final_probs.len() {
+            let scores = prefix_match_scores(&final_probs[i], &final_probs[j])?.0;
+            let score_sum = scores.sum_all()?;
+            loss_sum = (loss_sum + &score_sum)?;
+            overlap_total += score_sum.to_scalar::<f32>()? as f64;
+            pair_count += scores.elem_count();
         }
     }
 
@@ -1012,7 +1012,6 @@ fn read_write_alignment_loss(
 
     let slots = read_logits.len().min(write_logits.len());
     let device = read_logits[0].device();
-    let one = Tensor::ones((), DType::F32, device)?;
     let mut loss_sum = Tensor::zeros((), DType::F32, device)?;
     let mut prefix_total = 0.0;
     let mut exact_total = 0.0;
@@ -1024,20 +1023,16 @@ fn read_write_alignment_loss(
             &last_token_logits(&write_logits[slot])?,
             candle_core::D::Minus1,
         )?;
-        let (batch, seq_len, _depth, _arity) = read_probs.dims4()?;
-
-        for batch_index in 0..batch {
-            let write_target = write_probs.get(batch_index)?;
-            let read_rows = read_probs.get(batch_index)?;
-            for token_index in 0..seq_len {
-                let (prefix_score, exact_score) =
-                    prefix_match_scores(&read_rows.get(token_index)?, &write_target)?;
-                loss_sum = (loss_sum + (&one - &prefix_score)?)?;
-                prefix_total += prefix_score.to_scalar::<f32>()? as f64;
-                exact_total += exact_score.to_scalar::<f32>()? as f64;
-                count += 1;
-            }
-        }
+        let (batch, seq_len, depth, arity) = read_probs.dims4()?;
+        let write_targets = write_probs
+            .unsqueeze(1)?
+            .broadcast_as((batch, seq_len, depth, arity))?;
+        let (prefix_scores, exact_scores) = prefix_match_scores(&read_probs, &write_targets)?;
+        let slot_loss = (Tensor::ones_like(&prefix_scores)? - &prefix_scores)?.sum_all()?;
+        loss_sum = (loss_sum + &slot_loss)?;
+        prefix_total += prefix_scores.sum_all()?.to_scalar::<f32>()? as f64;
+        exact_total += exact_scores.sum_all()?.to_scalar::<f32>()? as f64;
+        count += prefix_scores.elem_count();
     }
 
     if count == 0 {
@@ -2294,6 +2289,39 @@ mod tests {
         let (prefix, exact) = prefix_match_scores(&probs, &probs)?;
         assert!((prefix.to_scalar::<f32>()? - 1.0).abs() < 1e-6);
         assert!((exact.to_scalar::<f32>()? - 1.0).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn test_prefix_match_scores_supports_batched_inputs() -> candle_core::Result<()> {
+        let dev = &Device::Cpu;
+        let probs_a = Tensor::from_vec(
+            vec![
+                1f32, 0.0, 0.0, 1.0, // sample 0
+                1.0, 0.0, 1.0, 0.0, // sample 1
+            ],
+            (2, 2, 2),
+            dev,
+        )?;
+        let probs_b = Tensor::from_vec(
+            vec![
+                1f32, 0.0, 0.0, 1.0, // sample 0
+                1.0, 0.0, 0.0, 1.0, // sample 1 diverges at depth 1
+            ],
+            (2, 2, 2),
+            dev,
+        )?;
+
+        let (prefix, exact) = prefix_match_scores(&probs_a, &probs_b)?;
+        assert_eq!(prefix.dims(), &[2]);
+        assert_eq!(exact.dims(), &[2]);
+
+        let prefix = prefix.to_vec1::<f32>()?;
+        let exact = exact.to_vec1::<f32>()?;
+        assert!((prefix[0] - 1.0).abs() < 1e-6);
+        assert!((exact[0] - 1.0).abs() < 1e-6);
+        assert!((prefix[1] - 0.5).abs() < 1e-6);
+        assert!(exact[1].abs() < 1e-6);
         Ok(())
     }
 
