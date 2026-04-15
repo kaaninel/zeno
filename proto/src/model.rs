@@ -356,6 +356,66 @@ impl ZenoAgent {
 
         let read_addr_logits: Vec<Tensor> = addr_results.iter().map(|(_, l)| l.clone()).collect();
 
+        if trie.is_empty() {
+            let memory_pool = Tensor::zeros((batch, seq_len, n_mem, d), DType::F32, device)?;
+            let density_tensor =
+                Tensor::zeros((batch, seq_len, n_mem, trie_depth), DType::U32, device)?;
+            let confidence = self
+                .confidence_gate
+                .forward(&density_tensor.reshape((batch * seq_len, n_mem, trie_depth))?)?
+                .reshape((batch, seq_len, n_mem))?;
+            let confidence_rows = confidence.to_vec3::<f32>()?;
+            let slots = batch * seq_len * n_mem;
+            let total_pairs = batch * seq_len * (n_mem.saturating_sub(1) * n_mem / 2);
+            let avg_confidence = if slots == 0 {
+                0.0
+            } else {
+                confidence_rows
+                    .iter()
+                    .flat_map(|batch_row| batch_row.iter().flat_map(|token| token.iter()))
+                    .map(|&value| value as f64)
+                    .sum::<f64>()
+                    / slots as f64
+            };
+            let min_confidence = confidence_rows
+                .iter()
+                .flat_map(|batch_row| batch_row.iter().flat_map(|token| token.iter()))
+                .map(|&value| value as f64)
+                .reduce(f64::min)
+                .unwrap_or(0.0);
+            let max_confidence = confidence_rows
+                .iter()
+                .flat_map(|batch_row| batch_row.iter().flat_map(|token| token.iter()))
+                .map(|&value| value as f64)
+                .reduce(f64::max)
+                .unwrap_or(0.0);
+            let training = MemoryTrainingSignals {
+                density: density_tensor,
+                confidence: confidence.clone(),
+                read_addresses: vec![vec![Vec::new(); batch * seq_len]; n_mem],
+            };
+            let diagnostics = MemoryDiagnostics {
+                read_hits: 0,
+                read_misses: slots,
+                overlap_pairs: 0,
+                total_pairs,
+                avg_mean_density: 0.0,
+                avg_final_density: 0.0,
+                avg_confidence,
+                min_confidence,
+                max_confidence,
+                avg_hit_confidence: 0.0,
+                avg_miss_confidence: avg_confidence,
+                density_confidence_corr: 0.0,
+            };
+            return Ok((
+                memory_pool,
+                read_addr_logits,
+                Some(diagnostics),
+                Some(training),
+            ));
+        }
+
         // For each AddrNet output, convert hard one-hot to byte indices and read from trie
         let mut mem_vecs = Vec::with_capacity(n_mem);
         let mut all_density_chains = Vec::with_capacity(batch * seq_len * n_mem);
