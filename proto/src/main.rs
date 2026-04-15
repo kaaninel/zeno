@@ -48,7 +48,9 @@ fn print_usage() {
     println!("  --memory                  Enable memory for evaluation");
     println!("  --follow                  Follow appended visualizer events");
     println!("  --save <path>             Save model weights after training");
-    println!("  --load <path>             Load model weights before training/eval");
+    println!(
+        "  --load <path>             Load model weights/checkpoint metadata before training/eval"
+    );
     println!(
         "  --checkpoint-dir <path>   Directory for periodic checkpoints (default: checkpoints)"
     );
@@ -186,11 +188,6 @@ fn main() -> Result<()> {
     })
     .expect("Failed to set Ctrl+C handler");
 
-    let ckpt = CheckpointConfig {
-        checkpoint_dir: Some(cli.checkpoint_dir.clone()),
-        checkpoint_every: cli.checkpoint_every,
-        interrupted: interrupted.clone(),
-    };
     let visualizer = match cli.trie_events.as_deref() {
         Some("-") => Some(TrieVisualizerRuntime::stdout()),
         Some(path) => Some(TrieVisualizerRuntime::create(&PathBuf::from(path))?),
@@ -211,10 +208,33 @@ fn main() -> Result<()> {
     );
 
     // Load weights if requested
-    if let Some(ref path) = cli.load_path {
+    let loaded_checkpoint = if let Some(ref path) = cli.load_path {
         println!("Loading weights from {}", path.display());
         varmap.load(path)?;
-    }
+        let metadata = train::load_checkpoint_metadata(path)?;
+        if let Some(ref metadata) = metadata {
+            println!(
+                "Loaded checkpoint metadata: phase={} step={}{}",
+                metadata.phase,
+                metadata.completed_step,
+                metadata
+                    .subphase
+                    .as_deref()
+                    .map(|subphase| format!(" subphase={subphase}"))
+                    .unwrap_or_default()
+            );
+        }
+        metadata
+    } else {
+        None
+    };
+
+    let ckpt = CheckpointConfig {
+        checkpoint_dir: Some(cli.checkpoint_dir.clone()),
+        checkpoint_every: cli.checkpoint_every,
+        interrupted: interrupted.clone(),
+        loaded: loaded_checkpoint,
+    };
 
     // Load dataset
     let dataset = ByteDataset::from_directory(&cli.data_dir, cfg.context_window)?;

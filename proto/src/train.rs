@@ -1,9 +1,11 @@
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ZenoConfig;
 use crate::data::ByteDataset;
@@ -28,6 +30,8 @@ pub struct CheckpointConfig {
     pub checkpoint_every: usize,
     /// Interrupt flag — set by Ctrl+C handler
     pub interrupted: Arc<AtomicBool>,
+    /// Metadata loaded from --load checkpoint sidecar
+    pub loaded: Option<CheckpointMetadata>,
 }
 
 impl Default for CheckpointConfig {
@@ -36,15 +40,100 @@ impl Default for CheckpointConfig {
             checkpoint_dir: None,
             checkpoint_every: 0,
             interrupted: Arc::new(AtomicBool::new(false)),
+            loaded: None,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointKind {
+    Periodic,
+    Final,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointMetadata {
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subphase: Option<String>,
+    pub completed_step: usize,
+    pub label: String,
+    pub kind: CheckpointKind,
+    pub saved_at_ms: u64,
+}
+
+impl CheckpointMetadata {
+    fn new(
+        phase: impl Into<String>,
+        subphase: Option<&str>,
+        completed_step: usize,
+        label: impl Into<String>,
+        kind: CheckpointKind,
+    ) -> Self {
+        Self {
+            phase: phase.into(),
+            subphase: subphase.map(ToOwned::to_owned),
+            completed_step,
+            label: label.into(),
+            kind,
+            saved_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResumeState {
+    completed_step: usize,
+    start_step: usize,
+}
+
+fn checkpoint_metadata_path(weights_path: &Path) -> PathBuf {
+    weights_path.with_extension("json")
+}
+
+fn infer_checkpoint_metadata_from_path(path: &Path) -> Option<CheckpointMetadata> {
+    let stem = path.file_stem()?.to_str()?;
+    let (phase, step) = stem.rsplit_once("_step")?;
+    let completed_step = step.parse().ok()?;
+    Some(CheckpointMetadata {
+        phase: phase.to_string(),
+        subphase: None,
+        completed_step,
+        label: stem.to_string(),
+        kind: CheckpointKind::Periodic,
+        saved_at_ms: 0,
+    })
+}
+
+pub fn load_checkpoint_metadata(path: &Path) -> anyhow::Result<Option<CheckpointMetadata>> {
+    let metadata_path = checkpoint_metadata_path(path);
+    match std::fs::read_to_string(&metadata_path) {
+        Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(infer_checkpoint_metadata_from_path(path))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Save a checkpoint to disk.
-fn save_checkpoint(varmap: &VarMap, dir: &Path, label: &str) -> anyhow::Result<()> {
+fn save_checkpoint(
+    varmap: &VarMap,
+    dir: &Path,
+    metadata: &CheckpointMetadata,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!("{label}.safetensors"));
+    let path = dir.join(format!("{}.safetensors", metadata.label));
     varmap.save(&path)?;
+    std::fs::write(
+        checkpoint_metadata_path(&path),
+        serde_json::to_vec_pretty(metadata)?,
+    )?;
     println!("  💾 Saved checkpoint: {}", path.display());
     Ok(())
 }
@@ -52,6 +141,66 @@ fn save_checkpoint(varmap: &VarMap, dir: &Path, label: &str) -> anyhow::Result<(
 /// Check if training should stop (interrupted flag set).
 fn should_stop(ckpt: &CheckpointConfig) -> bool {
     ckpt.interrupted.load(Ordering::Relaxed)
+}
+
+fn resume_state_for_phase(
+    ckpt: &CheckpointConfig,
+    phase: &str,
+    subphase: Option<&str>,
+    total_steps: usize,
+) -> ResumeState {
+    let completed_step = ckpt
+        .loaded
+        .as_ref()
+        .filter(|meta| meta.phase == phase)
+        .filter(|meta| meta.subphase.as_deref() == subphase)
+        .map(|meta| meta.completed_step.min(total_steps))
+        .unwrap_or(0);
+    ResumeState {
+        completed_step,
+        start_step: completed_step.saturating_add(1),
+    }
+}
+
+fn log_resume_state(phase: &str, subphase: Option<&str>, total_steps: usize, resume: ResumeState) {
+    if resume.completed_step > 0 {
+        match subphase {
+            Some(subphase) => println!(
+                "  Resuming {phase}/{subphase} from step {} of {}",
+                resume.completed_step, total_steps
+            ),
+            None => println!(
+                "  Resuming {phase} from step {} of {}",
+                resume.completed_step, total_steps
+            ),
+        }
+    }
+}
+
+fn phase5_subphase_order(subphase: &str) -> Option<usize> {
+    match subphase {
+        "phase5a" => Some(0),
+        "phase5b" => Some(1),
+        "phase5c_base" => Some(2),
+        "phase5c_addr" => Some(3),
+        _ => None,
+    }
+}
+
+fn should_run_phase5_subphase(ckpt: &CheckpointConfig, subphase: &str) -> bool {
+    let Some(loaded) = ckpt.loaded.as_ref() else {
+        return true;
+    };
+    if loaded.phase != "phase5" {
+        return true;
+    }
+    let Some(current_order) = phase5_subphase_order(subphase) else {
+        return true;
+    };
+    let Some(loaded_order) = loaded.subphase.as_deref().and_then(phase5_subphase_order) else {
+        return true;
+    };
+    current_order >= loaded_order
 }
 
 /// Gradient-clipped optimizer step.
@@ -479,6 +628,12 @@ pub fn train_phase2(
         pcfg.lr, pcfg.steps, pcfg.batch_size, pcfg.max_grad_norm
     );
     println!("  Gate: loss < {:.1}", pcfg.gate_loss);
+    let resume = resume_state_for_phase(ckpt, "phase2", None, pcfg.steps);
+    log_resume_state("phase2", None, pcfg.steps, resume);
+    if resume.start_step > pcfg.steps {
+        println!("  Checkpoint already completed all configured Phase 2 steps.");
+        return Ok(0.0);
+    }
 
     let prefixes = agent.phase2_params();
     let named_vars = filter_named_vars(varmap, &prefixes);
@@ -502,7 +657,7 @@ pub fn train_phase2(
     let mut running_count = 0usize;
     let mut best_loss = f64::MAX;
 
-    for step in 1..=pcfg.steps {
+    for step in resume.start_step..=pcfg.steps {
         if should_stop(ckpt) {
             println!("  ⚠ Interrupted at step {}", step);
             save_checkpoint(
@@ -510,7 +665,13 @@ pub fn train_phase2(
                 ckpt.checkpoint_dir
                     .as_deref()
                     .unwrap_or(Path::new("checkpoints")),
-                "phase2_interrupt",
+                &CheckpointMetadata::new(
+                    "phase2",
+                    None,
+                    step.saturating_sub(1),
+                    "phase2_interrupt",
+                    CheckpointKind::Interrupted,
+                ),
             )?;
             break;
         }
@@ -555,14 +716,34 @@ pub fn train_phase2(
         // Periodic checkpoint
         if ckpt.checkpoint_every > 0 && step % ckpt.checkpoint_every == 0 {
             if let Some(ref dir) = ckpt.checkpoint_dir {
-                save_checkpoint(varmap, dir, &format!("phase2_step{step}"))?;
+                save_checkpoint(
+                    varmap,
+                    dir,
+                    &CheckpointMetadata::new(
+                        "phase2",
+                        None,
+                        step,
+                        format!("phase2_step{step}"),
+                        CheckpointKind::Periodic,
+                    ),
+                )?;
             }
         }
     }
 
     // End-of-phase checkpoint
     if let Some(ref dir) = ckpt.checkpoint_dir {
-        save_checkpoint(varmap, dir, "phase2_final")?;
+        save_checkpoint(
+            varmap,
+            dir,
+            &CheckpointMetadata::new(
+                "phase2",
+                None,
+                pcfg.steps,
+                "phase2_final",
+                CheckpointKind::Final,
+            ),
+        )?;
     }
 
     println!("  Phase 2 complete. Best loss={:.4}", best_loss);
@@ -896,6 +1077,12 @@ pub fn train_phase3(
         pcfg.diversity_weight,
         pcfg.query_write_weight
     );
+    let resume = resume_state_for_phase(ckpt, "phase3", None, pcfg.steps);
+    log_resume_state("phase3", None, pcfg.steps, resume);
+    if resume.start_step > pcfg.steps {
+        println!("  Checkpoint already completed all configured Phase 3 steps.");
+        return Ok(0.0);
+    }
 
     let prefixes = agent.phase3_params();
     let named_vars = filter_named_vars(varmap, &prefixes);
@@ -914,7 +1101,7 @@ pub fn train_phase3(
     let mut best_entropy = 0.0;
     let mut best_query_write = 0.0;
 
-    for step in 1..=pcfg.steps {
+    for step in resume.start_step..=pcfg.steps {
         if should_stop(ckpt) {
             println!("  ⚠ Interrupted at step {}", step);
             save_checkpoint(
@@ -922,7 +1109,13 @@ pub fn train_phase3(
                 ckpt.checkpoint_dir
                     .as_deref()
                     .unwrap_or(Path::new("checkpoints")),
-                "phase3_interrupt",
+                &CheckpointMetadata::new(
+                    "phase3",
+                    None,
+                    step.saturating_sub(1),
+                    "phase3_interrupt",
+                    CheckpointKind::Interrupted,
+                ),
             )?;
             break;
         }
@@ -1002,13 +1195,33 @@ pub fn train_phase3(
 
         if ckpt.checkpoint_every > 0 && step % ckpt.checkpoint_every == 0 {
             if let Some(ref dir) = ckpt.checkpoint_dir {
-                save_checkpoint(varmap, dir, &format!("phase3_step{step}"))?;
+                save_checkpoint(
+                    varmap,
+                    dir,
+                    &CheckpointMetadata::new(
+                        "phase3",
+                        None,
+                        step,
+                        format!("phase3_step{step}"),
+                        CheckpointKind::Periodic,
+                    ),
+                )?;
             }
         }
     }
 
     if let Some(ref dir) = ckpt.checkpoint_dir {
-        save_checkpoint(varmap, dir, "phase3_final")?;
+        save_checkpoint(
+            varmap,
+            dir,
+            &CheckpointMetadata::new(
+                "phase3",
+                None,
+                pcfg.steps,
+                "phase3_final",
+                CheckpointKind::Final,
+            ),
+        )?;
     }
 
     println!(
@@ -1332,6 +1545,12 @@ pub fn train_phase4(
         "  Supervision weights: retrieval={} density={}",
         pcfg.retrieval_supervision_weight, pcfg.density_supervision_weight
     );
+    let resume = resume_state_for_phase(ckpt, "phase4", None, pcfg.steps);
+    log_resume_state("phase4", None, pcfg.steps, resume);
+    if resume.start_step > pcfg.steps {
+        println!("  Checkpoint already completed all configured Phase 4 steps.");
+        return Ok(0.0);
+    }
 
     let prefixes = agent.phase4_params();
     let named_vars = filter_named_vars(varmap, &prefixes);
@@ -1356,7 +1575,7 @@ pub fn train_phase4(
     let mut best_improvement = 0.0;
     let mut best_retrieval_exact = 0.0_f64;
 
-    for step in 1..=pcfg.steps {
+    for step in resume.start_step..=pcfg.steps {
         if should_stop(ckpt) {
             println!("  ⚠ Interrupted at step {}", step);
             save_checkpoint(
@@ -1364,7 +1583,13 @@ pub fn train_phase4(
                 ckpt.checkpoint_dir
                     .as_deref()
                     .unwrap_or(Path::new("checkpoints")),
-                "phase4_interrupt",
+                &CheckpointMetadata::new(
+                    "phase4",
+                    None,
+                    step.saturating_sub(1),
+                    "phase4_interrupt",
+                    CheckpointKind::Interrupted,
+                ),
             )?;
             break;
         }
@@ -1496,7 +1721,17 @@ pub fn train_phase4(
         // Periodic checkpoint
         if ckpt.checkpoint_every > 0 && step % ckpt.checkpoint_every == 0 {
             if let Some(ref dir) = ckpt.checkpoint_dir {
-                save_checkpoint(varmap, dir, &format!("phase4_step{step}"))?;
+                save_checkpoint(
+                    varmap,
+                    dir,
+                    &CheckpointMetadata::new(
+                        "phase4",
+                        None,
+                        step,
+                        format!("phase4_step{step}"),
+                        CheckpointKind::Periodic,
+                    ),
+                )?;
             }
         }
 
@@ -1508,7 +1743,17 @@ pub fn train_phase4(
     }
 
     if let Some(ref dir) = ckpt.checkpoint_dir {
-        save_checkpoint(varmap, dir, "phase4_final")?;
+        save_checkpoint(
+            varmap,
+            dir,
+            &CheckpointMetadata::new(
+                "phase4",
+                None,
+                pcfg.steps,
+                "phase4_final",
+                CheckpointKind::Final,
+            ),
+        )?;
     }
 
     println!(
@@ -1562,6 +1807,7 @@ impl Default for Phase5Config {
 }
 
 fn train_phase5_sub(
+    checkpoint_prefix: &str,
     label: &str,
     agent: &ZenoAgent,
     varmap: &VarMap,
@@ -1580,6 +1826,12 @@ fn train_phase5_sub(
 ) -> anyhow::Result<f64> {
     println!("  --- Phase 5{} ---", label);
     let phase_name = format!("phase5{}", label);
+    let resume = resume_state_for_phase(ckpt, "phase5", Some(checkpoint_prefix), steps);
+    log_resume_state("phase5", Some(checkpoint_prefix), steps, resume);
+    if resume.start_step > steps {
+        println!("    Checkpoint already completed all configured steps for {checkpoint_prefix}.");
+        return Ok(0.0);
+    }
     if let Some(visualizer) = visualizer {
         visualizer.emit_phase_started(phase_name.clone())?;
     }
@@ -1600,7 +1852,7 @@ fn train_phase5_sub(
     let mut running_count = 0usize;
     let mut best_loss = f64::MAX;
 
-    for step in 1..=steps {
+    for step in resume.start_step..=steps {
         if should_stop(ckpt) {
             println!("    ⚠ Interrupted at step {}", step);
             save_checkpoint(
@@ -1608,7 +1860,13 @@ fn train_phase5_sub(
                 ckpt.checkpoint_dir
                     .as_deref()
                     .unwrap_or(Path::new("checkpoints")),
-                &format!("phase5{label}_interrupt"),
+                &CheckpointMetadata::new(
+                    "phase5",
+                    Some(checkpoint_prefix),
+                    step.saturating_sub(1),
+                    format!("{checkpoint_prefix}_interrupt"),
+                    CheckpointKind::Interrupted,
+                ),
             )?;
             break;
         }
@@ -1656,6 +1914,22 @@ fn train_phase5_sub(
             running_count = 0;
         }
 
+        if ckpt.checkpoint_every > 0 && step % ckpt.checkpoint_every == 0 {
+            if let Some(ref dir) = ckpt.checkpoint_dir {
+                save_checkpoint(
+                    varmap,
+                    dir,
+                    &CheckpointMetadata::new(
+                        "phase5",
+                        Some(checkpoint_prefix),
+                        step,
+                        format!("{checkpoint_prefix}_step{step}"),
+                        CheckpointKind::Periodic,
+                    ),
+                )?;
+            }
+        }
+
         if trie.len() > 50_000 {
             trie.reset();
             ring.reset();
@@ -1692,23 +1966,29 @@ pub fn train_phase5(
         p5a.push(format!("block_{i}.mem_attn"));
         p5a.push(format!("block_{i}.norm3"));
     }
-    let loss_5a = train_phase5_sub(
-        "a (mem_attn + write heads)",
-        agent,
-        varmap,
-        dataset,
-        cfg,
-        &p5a,
-        pcfg.lr_base,
-        pcfg.steps_per_sub,
-        pcfg.batch_size,
-        pcfg.log_every,
-        pcfg.tau,
-        pcfg.max_grad_norm,
-        ckpt,
-        device,
-        visualizer,
-    )?;
+    let loss_5a = if should_run_phase5_subphase(ckpt, "phase5a") {
+        train_phase5_sub(
+            "phase5a",
+            "a (mem_attn + write heads)",
+            agent,
+            varmap,
+            dataset,
+            cfg,
+            &p5a,
+            pcfg.lr_base,
+            pcfg.steps_per_sub,
+            pcfg.batch_size,
+            pcfg.log_every,
+            pcfg.tau,
+            pcfg.max_grad_norm,
+            ckpt,
+            device,
+            visualizer,
+        )?
+    } else {
+        println!("  --- Skipping Phase 5a; loaded checkpoint is later in phase5 ---");
+        0.0
+    };
 
     if should_stop(ckpt) {
         return Ok(loss_5a);
@@ -1720,23 +2000,29 @@ pub fn train_phase5(
         p5b.push(format!("block_{i}.ctx_attn"));
         p5b.push(format!("block_{i}.norm2"));
     }
-    let loss_5b = train_phase5_sub(
-        "b (+ context cross-attn)",
-        agent,
-        varmap,
-        dataset,
-        cfg,
-        &p5b,
-        pcfg.lr_base,
-        pcfg.steps_per_sub,
-        pcfg.batch_size,
-        pcfg.log_every,
-        pcfg.tau,
-        pcfg.max_grad_norm,
-        ckpt,
-        device,
-        visualizer,
-    )?;
+    let loss_5b = if should_run_phase5_subphase(ckpt, "phase5b") {
+        train_phase5_sub(
+            "phase5b",
+            "b (+ context cross-attn)",
+            agent,
+            varmap,
+            dataset,
+            cfg,
+            &p5b,
+            pcfg.lr_base,
+            pcfg.steps_per_sub,
+            pcfg.batch_size,
+            pcfg.log_every,
+            pcfg.tau,
+            pcfg.max_grad_norm,
+            ckpt,
+            device,
+            visualizer,
+        )?
+    } else {
+        println!("  --- Skipping Phase 5b; loaded checkpoint is later in phase5 ---");
+        loss_5a
+    };
 
     if should_stop(ckpt) {
         return Ok(loss_5b);
@@ -1755,23 +2041,29 @@ pub fn train_phase5(
     p5c.push("context_vectors".to_string());
     p5c.push("final_norm".to_string());
 
-    let loss_5c_base = train_phase5_sub(
-        "c (self-attn + FFN at 0.1×)",
-        agent,
-        varmap,
-        dataset,
-        cfg,
-        &p5c,
-        pcfg.lr_base * 0.1,
-        pcfg.steps_per_sub,
-        pcfg.batch_size,
-        pcfg.log_every,
-        pcfg.tau,
-        pcfg.max_grad_norm,
-        ckpt,
-        device,
-        visualizer,
-    )?;
+    let loss_5c_base = if should_run_phase5_subphase(ckpt, "phase5c_base") {
+        train_phase5_sub(
+            "phase5c_base",
+            "c (self-attn + FFN at 0.1×)",
+            agent,
+            varmap,
+            dataset,
+            cfg,
+            &p5c,
+            pcfg.lr_base * 0.1,
+            pcfg.steps_per_sub,
+            pcfg.batch_size,
+            pcfg.log_every,
+            pcfg.tau,
+            pcfg.max_grad_norm,
+            ckpt,
+            device,
+            visualizer,
+        )?
+    } else {
+        println!("  --- Skipping Phase 5c base; loaded checkpoint is later in phase5 ---");
+        loss_5b
+    };
 
     if should_stop(ckpt) {
         return Ok(loss_5c_base);
@@ -1779,26 +2071,42 @@ pub fn train_phase5(
 
     // Then: AddrNet at 0.01× LR
     let p5c_addr = vec!["addr_nets".to_string()];
-    let loss_5c_addr = train_phase5_sub(
-        "c (AddrNet at 0.01×)",
-        agent,
-        varmap,
-        dataset,
-        cfg,
-        &p5c_addr,
-        pcfg.lr_base * pcfg.lr_addr_multiplier,
-        pcfg.steps_per_sub / 2,
-        pcfg.batch_size,
-        pcfg.log_every,
-        pcfg.tau,
-        pcfg.max_grad_norm,
-        ckpt,
-        device,
-        visualizer,
-    )?;
+    let loss_5c_addr = if should_run_phase5_subphase(ckpt, "phase5c_addr") {
+        train_phase5_sub(
+            "phase5c_addr",
+            "c (AddrNet at 0.01×)",
+            agent,
+            varmap,
+            dataset,
+            cfg,
+            &p5c_addr,
+            pcfg.lr_base * pcfg.lr_addr_multiplier,
+            pcfg.steps_per_sub / 2,
+            pcfg.batch_size,
+            pcfg.log_every,
+            pcfg.tau,
+            pcfg.max_grad_norm,
+            ckpt,
+            device,
+            visualizer,
+        )?
+    } else {
+        println!("  --- Skipping Phase 5c AddrNet; loaded checkpoint is later in phase5 ---");
+        loss_5c_base
+    };
 
     if let Some(ref dir) = ckpt.checkpoint_dir {
-        save_checkpoint(varmap, dir, "phase5_final")?;
+        save_checkpoint(
+            varmap,
+            dir,
+            &CheckpointMetadata::new(
+                "phase5",
+                None,
+                pcfg.steps_per_sub,
+                "phase5_final",
+                CheckpointKind::Final,
+            ),
+        )?;
     }
 
     println!(
@@ -1899,6 +2207,7 @@ mod tests {
     use super::*;
     use candle_core::Tensor;
     use candle_nn::VarBuilder;
+    use std::fs;
 
     #[test]
     fn test_filter_vars() -> candle_core::Result<()> {
@@ -2071,5 +2380,108 @@ mod tests {
         assert_eq!(reads.reads[2].density_chain, vec![5, 4, 3]);
         assert_eq!(reads.reads[3].density_chain, vec![6, 3]);
         Ok(())
+    }
+
+    fn test_checkpoint_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("checkpoint-tests")
+            .join(format!("{name}-{nonce}.safetensors"))
+    }
+
+    #[test]
+    fn test_load_checkpoint_metadata_reads_interrupt_sidecar() {
+        let path = test_checkpoint_path("interrupt");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let metadata = CheckpointMetadata::new(
+            "phase4",
+            Some("custom-subphase"),
+            37,
+            "manual_interrupt",
+            CheckpointKind::Interrupted,
+        );
+        fs::write(
+            checkpoint_metadata_path(&path),
+            serde_json::to_vec_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_checkpoint_metadata(&path).unwrap().unwrap();
+        assert_eq!(loaded, metadata);
+
+        let _ = fs::remove_file(checkpoint_metadata_path(&path));
+    }
+
+    #[test]
+    fn test_load_checkpoint_metadata_falls_back_to_step_filename() {
+        let path = PathBuf::from("/root/zeno/proto/checkpoints/phase3_step42.safetensors");
+        let loaded = load_checkpoint_metadata(&path).unwrap().unwrap();
+        assert_eq!(loaded.phase, "phase3");
+        assert_eq!(loaded.completed_step, 42);
+        assert_eq!(loaded.kind, CheckpointKind::Periodic);
+    }
+
+    #[test]
+    fn test_resume_state_only_applies_same_phase_and_subphase() {
+        let ckpt = CheckpointConfig {
+            loaded: Some(CheckpointMetadata::new(
+                "phase5",
+                Some("phase5b"),
+                9,
+                "phase5b_step9",
+                CheckpointKind::Periodic,
+            )),
+            ..CheckpointConfig::default()
+        };
+
+        let same_subphase = resume_state_for_phase(&ckpt, "phase5", Some("phase5b"), 20);
+        assert_eq!(
+            same_subphase,
+            ResumeState {
+                completed_step: 9,
+                start_step: 10
+            }
+        );
+
+        let other_subphase = resume_state_for_phase(&ckpt, "phase5", Some("phase5a"), 20);
+        assert_eq!(
+            other_subphase,
+            ResumeState {
+                completed_step: 0,
+                start_step: 1
+            }
+        );
+
+        let other_phase = resume_state_for_phase(&ckpt, "phase4", None, 20);
+        assert_eq!(
+            other_phase,
+            ResumeState {
+                completed_step: 0,
+                start_step: 1
+            }
+        );
+    }
+
+    #[test]
+    fn test_should_run_phase5_subphase_skips_earlier_stages_when_resuming_later() {
+        let ckpt = CheckpointConfig {
+            loaded: Some(CheckpointMetadata::new(
+                "phase5",
+                Some("phase5c_base"),
+                4,
+                "phase5c_base_step4",
+                CheckpointKind::Periodic,
+            )),
+            ..CheckpointConfig::default()
+        };
+
+        assert!(!should_run_phase5_subphase(&ckpt, "phase5a"));
+        assert!(!should_run_phase5_subphase(&ckpt, "phase5b"));
+        assert!(should_run_phase5_subphase(&ckpt, "phase5c_base"));
+        assert!(should_run_phase5_subphase(&ckpt, "phase5c_addr"));
     }
 }
