@@ -48,9 +48,7 @@ impl ConfidenceGate {
         let (_batch, _n_slots, _depth) = density_chain.dims3()?;
 
         // Clamp density counts to [0, 255] for safe embedding lookup.
-        let clamped = density_chain
-            .clamp(0u32, 255u32)?
-            .to_dtype(DType::U32)?;
+        let clamped = density_chain.clamp(0u32, 255u32)?.to_dtype(DType::U32)?;
 
         // Density embeddings: [batch, n_slots, trie_depth] → [batch, n_slots, trie_depth, e]
         let d_embed = self.density_embedding.forward(&clamped)?;
@@ -91,11 +89,7 @@ mod tests {
         let gate = ConfidenceGate::new(vb, &cfg)?;
 
         let batch = 2;
-        let density = Tensor::zeros(
-            (batch, cfg.n_mem_slots, cfg.trie_depth),
-            DType::U32,
-            dev,
-        )?;
+        let density = Tensor::zeros((batch, cfg.n_mem_slots, cfg.trie_depth), DType::U32, dev)?;
 
         let conf = gate.forward(&density)?;
         assert_eq!(conf.dims(), &[batch, cfg.n_mem_slots]);
@@ -119,11 +113,7 @@ mod tests {
 
         let _gate = ConfidenceGate::new(vb, &cfg)?;
 
-        let total: usize = varmap
-            .all_vars()
-            .iter()
-            .map(|v| v.elem_count())
-            .sum();
+        let total: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
         assert_eq!(total, 2_129);
         Ok(())
     }

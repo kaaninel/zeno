@@ -15,9 +15,7 @@ fn ext_to_type(ext: &str) -> &str {
 }
 
 /// Known text-file extensions we scan for.
-const TEXT_EXTENSIONS: &[&str] = &[
-    "md", "txt", "rs", "py", "js", "ts", "go", "c", "cpp", "h",
-];
+const TEXT_EXTENSIONS: &[&str] = &["md", "txt", "rs", "py", "js", "ts", "go", "c", "cpp", "h"];
 
 /// Build the inline header bytes: `source:{name}\ntype:{dtype}\n\n`
 fn make_header(source: &str, dtype: &str) -> Vec<u8> {
@@ -70,10 +68,7 @@ impl ByteDataset {
             if !path.is_file() {
                 continue;
             }
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if !TEXT_EXTENSIONS.contains(&ext) {
                 continue;
             }
@@ -121,11 +116,7 @@ impl ByteDataset {
     ///
     /// - input:  bytes\[0..cw-1\] → \[batch, cw-1\] u32
     /// - target: bytes\[1..cw\]   → \[batch, cw-1\] u32
-    pub fn get_batch(
-        &self,
-        indices: &[usize],
-        device: &Device,
-    ) -> Result<(Tensor, Tensor)> {
+    pub fn get_batch(&self, indices: &[usize], device: &Device) -> Result<(Tensor, Tensor)> {
         let seq_len = self.context_window - 1; // 255
         let mut input_data: Vec<u32> = Vec::with_capacity(indices.len() * seq_len);
         let mut target_data: Vec<u32> = Vec::with_capacity(indices.len() * seq_len);
@@ -146,19 +137,14 @@ impl ByteDataset {
         }
 
         let batch = indices.len();
-        let input = Tensor::from_vec(input_data, (batch, seq_len), device)?
-            .to_dtype(DType::U32)?;
-        let target = Tensor::from_vec(target_data, (batch, seq_len), device)?
-            .to_dtype(DType::U32)?;
+        let input = Tensor::from_vec(input_data, (batch, seq_len), device)?.to_dtype(DType::U32)?;
+        let target =
+            Tensor::from_vec(target_data, (batch, seq_len), device)?.to_dtype(DType::U32)?;
         Ok((input, target))
     }
 
     /// Sample `batch_size` random chunks and return (input, target).
-    pub fn get_random_batch(
-        &self,
-        batch_size: usize,
-        device: &Device,
-    ) -> Result<(Tensor, Tensor)> {
+    pub fn get_random_batch(&self, batch_size: usize, device: &Device) -> Result<(Tensor, Tensor)> {
         if self.chunks.is_empty() {
             bail!("dataset is empty");
         }
@@ -191,55 +177,70 @@ impl ByteDataset {
         indices.shuffle(&mut rng);
 
         for group in indices.chunks(batch_size) {
-            let seq_len = self.context_window - 1;
-            let batch = group.len();
-
-            let mut first_in = Vec::with_capacity(batch * seq_len);
-            let mut first_tgt = Vec::with_capacity(batch * seq_len);
-            let mut second_in = Vec::with_capacity(batch * seq_len);
-            let mut second_tgt = Vec::with_capacity(batch * seq_len);
-
-            for &idx in group {
-                let orig = &self.chunks[idx];
-
-                // Extract raw content after the original header.
-                // The header ends at the first occurrence of "\n\n".
-                let content_start = find_header_end(orig).unwrap_or(0);
-                let content = &orig[content_start..];
-
-                // Reconstruct source/type from the original header.
-                let (source, dtype) = parse_header(orig);
-
-                let pass1_header = make_pass_header(&source, &dtype, 1);
-                let chunk1 = build_chunk(content, &pass1_header, self.context_window);
-
-                let pass2_header = make_pass_header(&source, &dtype, 2);
-                let chunk2 = build_chunk(content, &pass2_header, self.context_window);
-
-                for i in 0..seq_len {
-                    first_in.push(chunk1[i] as u32);
-                    first_tgt.push(chunk1[i + 1] as u32);
-                    second_in.push(chunk2[i] as u32);
-                    second_tgt.push(chunk2[i + 1] as u32);
-                }
-            }
-
-            let fi = Tensor::from_vec(first_in, (batch, seq_len), device)?
-                .to_dtype(DType::U32)?;
-            let ft = Tensor::from_vec(first_tgt, (batch, seq_len), device)?
-                .to_dtype(DType::U32)?;
-            let si = Tensor::from_vec(second_in, (batch, seq_len), device)?
-                .to_dtype(DType::U32)?;
-            let st = Tensor::from_vec(second_tgt, (batch, seq_len), device)?
-                .to_dtype(DType::U32)?;
-
-            batches.push((fi, ft, si, st));
+            batches.push(self.build_reencounter_batch(group, device)?);
         }
 
         Ok(batches)
     }
 
+    /// Sample one random re-encounter batch for Phase 4 training.
+    pub fn get_random_reencounter_batch(
+        &self,
+        batch_size: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        if self.chunks.is_empty() {
+            bail!("dataset is empty");
+        }
+        let mut rng = rand::thread_rng();
+        let indices: Vec<usize> = (0..batch_size)
+            .map(|_| rng.gen_range(0..self.chunks.len()))
+            .collect();
+        self.build_reencounter_batch(&indices, device)
+    }
+
     // ── internal helpers ──
+
+    fn build_reencounter_batch(
+        &self,
+        indices: &[usize],
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let seq_len = self.context_window - 1;
+        let batch = indices.len();
+
+        let mut first_in = Vec::with_capacity(batch * seq_len);
+        let mut first_tgt = Vec::with_capacity(batch * seq_len);
+        let mut second_in = Vec::with_capacity(batch * seq_len);
+        let mut second_tgt = Vec::with_capacity(batch * seq_len);
+
+        for &idx in indices {
+            let orig = &self.chunks[idx];
+
+            let content_start = find_header_end(orig).unwrap_or(0);
+            let content = &orig[content_start..];
+            let (source, dtype) = parse_header(orig);
+
+            let pass1_header = make_pass_header(&source, &dtype, 1);
+            let chunk1 = build_chunk(content, &pass1_header, self.context_window);
+
+            let pass2_header = make_pass_header(&source, &dtype, 2);
+            let chunk2 = build_chunk(content, &pass2_header, self.context_window);
+
+            for i in 0..seq_len {
+                first_in.push(chunk1[i] as u32);
+                first_tgt.push(chunk1[i + 1] as u32);
+                second_in.push(chunk2[i] as u32);
+                second_tgt.push(chunk2[i + 1] as u32);
+            }
+        }
+
+        let fi = Tensor::from_vec(first_in, (batch, seq_len), device)?.to_dtype(DType::U32)?;
+        let ft = Tensor::from_vec(first_tgt, (batch, seq_len), device)?.to_dtype(DType::U32)?;
+        let si = Tensor::from_vec(second_in, (batch, seq_len), device)?.to_dtype(DType::U32)?;
+        let st = Tensor::from_vec(second_tgt, (batch, seq_len), device)?.to_dtype(DType::U32)?;
+        Ok((fi, ft, si, st))
+    }
 
     /// Split `data` into `context_window`-sized chunks, each prefixed with `header`.
     /// Content is truncated or zero-padded to exactly `context_window` bytes.
@@ -274,9 +275,7 @@ impl ByteDataset {
 
 /// Find the byte offset just past the first `\n\n` in `buf`.
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|p| p + 2)
+    buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2)
 }
 
 /// Best-effort extraction of source and type from an existing chunk header.
@@ -363,5 +362,16 @@ mod tests {
         assert_eq!(ft.dims()[1], 255);
         assert_eq!(si.dims()[1], 255);
         assert_eq!(st.dims()[1], 255);
+    }
+
+    #[test]
+    fn test_random_reencounter_batch() {
+        let data = vec![b'Q'; 512];
+        let ds = ByteDataset::from_bytes(&data, "re.txt", "docs", 256).unwrap();
+        let (fi, ft, si, st) = ds.get_random_reencounter_batch(2, &Device::Cpu).unwrap();
+        assert_eq!(fi.dims(), &[2, 255]);
+        assert_eq!(ft.dims(), &[2, 255]);
+        assert_eq!(si.dims(), &[2, 255]);
+        assert_eq!(st.dims(), &[2, 255]);
     }
 }

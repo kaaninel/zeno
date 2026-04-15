@@ -48,13 +48,21 @@ impl TransformerBlock {
         memory_pool: &Tensor,
     ) -> Result<Tensor> {
         // Self-attention with residual (self_attn already adds residual internally)
-        let x = self.self_attn.forward(&self.norm1.forward(x)?, pos_offset)?;
+        let x = self
+            .self_attn
+            .forward(&self.norm1.forward(x)?, pos_offset)?;
 
         // Context cross-attention with residual
-        let x = (&x + self.ctx_attn.forward(&self.norm2.forward(&x)?, context_pool)?)?;
+        let x = (&x
+            + self
+                .ctx_attn
+                .forward(&self.norm2.forward(&x)?, context_pool)?)?;
 
         // Memory cross-attention with residual
-        let x = (&x + self.mem_attn.forward(&self.norm3.forward(&x)?, memory_pool)?)?;
+        let x = (&x
+            + self
+                .mem_attn
+                .forward_per_token(&self.norm3.forward(&x)?, memory_pool)?)?;
 
         // SiLU FFN with residual
         let ffn_out = self.ffn_up.forward(&self.norm4.forward(&x)?)?.silu()?;
@@ -129,8 +137,56 @@ pub struct ForwardOutput {
     pub write_values: Vec<Tensor>,
     /// `[batch, seq_len, 1]` write strength
     pub write_strength: Tensor,
-    /// 3 × `[batch, 1, trie_depth, trie_arity]` raw read-address logits (Phase 3 loss)
+    /// 3 × `[batch, seq_len, trie_depth, trie_arity]` raw read-address logits (Phase 3 loss)
     pub read_addr_logits: Vec<Tensor>,
+    /// Memory-path instrumentation captured during trie reads.
+    pub memory_diagnostics: Option<MemoryDiagnostics>,
+    /// Per-slot memory signals used by Phase 4 supervision.
+    pub memory_training: Option<MemoryTrainingSignals>,
+}
+
+pub struct MemoryTrainingSignals {
+    /// `[batch, seq_len, n_mem_slots, trie_depth]` structural density chains.
+    pub density: Tensor,
+    /// `[batch, seq_len, n_mem_slots]` confidence gate outputs.
+    pub confidence: Tensor,
+    /// Flattened read addresses per slot (`batch * seq_len` entries each).
+    pub read_addresses: Vec<Vec<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryDiagnostics {
+    pub read_hits: usize,
+    pub read_misses: usize,
+    pub overlap_pairs: usize,
+    pub total_pairs: usize,
+    pub avg_mean_density: f64,
+    pub avg_final_density: f64,
+    pub avg_confidence: f64,
+    pub min_confidence: f64,
+    pub max_confidence: f64,
+    pub avg_hit_confidence: f64,
+    pub avg_miss_confidence: f64,
+    pub density_confidence_corr: f64,
+}
+
+impl MemoryDiagnostics {
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.read_hits + self.read_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.read_hits as f64 / total as f64
+        }
+    }
+
+    pub fn overlap_rate(&self) -> f64 {
+        if self.total_pairs == 0 {
+            0.0
+        } else {
+            self.overlap_pairs as f64 / self.total_pairs as f64
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,11 +250,10 @@ impl ZenoAgent {
         use_memory: bool,
         device: &Device,
     ) -> Result<ForwardOutput> {
-        let (batch, _seq_len) = input_ids.dims2()?;
+        let (batch, seq_len) = input_ids.dims2()?;
         let d = self.config.d_model;
         let n_ctx = self.config.n_context_vectors;
         let n_reg = self.config.n_register;
-        let n_mem = self.config.n_mem_slots;
 
         // 1. Embed input_ids → [batch, seq_len, d_model]
         let embedded = self.embedding.forward(input_ids)?;
@@ -218,12 +273,22 @@ impl ZenoAgent {
 
         let context_pool = Tensor::cat(&[&ctx_learned, &reg_tensor], 1)?;
 
-        // 3. Memory pool via trie reads (or zeros if memory disabled)
-        let (memory_pool, read_addr_logits) = if use_memory {
-            self.build_memory_pool(&embedded, trie, gumbel_temp, batch, d, n_mem, device)?
+        let context_summary = context_pool
+            .mean(1)?
+            .unsqueeze(1)?
+            .broadcast_as((batch, seq_len, d))?;
+        let query_states = (&embedded + &context_summary)?;
+
+        // 3. Memory pool via token-conditioned trie reads (or zeros if memory disabled)
+        let (memory_pool, read_addr_logits, memory_diagnostics, memory_training) = if use_memory {
+            self.build_memory_pool(&query_states, trie, gumbel_temp, batch, seq_len, d, device)?
         } else {
-            let zeros = Tensor::zeros((batch, n_mem, d), DType::F32, device)?;
-            (zeros, Vec::new())
+            let zeros = Tensor::zeros(
+                (batch, seq_len, self.config.n_mem_slots, d),
+                DType::F32,
+                device,
+            )?;
+            (zeros, Vec::new(), None, None)
         };
 
         // 4. Run through transformer blocks
@@ -258,61 +323,73 @@ impl ZenoAgent {
             write_values,
             write_strength,
             read_addr_logits,
+            memory_diagnostics,
+            memory_training,
         })
     }
 
-    /// Build memory pool from trie reads using mean-pooled address generation.
+    /// Build token-local memory slots from trie reads.
     ///
-    /// Computes one set of 3 read addresses from the mean of all embedded tokens,
-    /// reads 3 vectors from the trie, applies confidence gating, and returns
-    /// `[batch, n_mem_slots, d_model]`.
+    /// Computes 3 read addresses per token from a token-conditioned query state,
+    /// reads 3 vectors from the trie for each token, applies confidence gating,
+    /// and returns `[batch, seq_len, n_mem_slots, d_model]`.
     fn build_memory_pool(
         &self,
-        embedded: &Tensor,
+        query_states: &Tensor,
         trie: &ProtoTrie,
         gumbel_temp: f64,
         batch: usize,
+        seq_len: usize,
         d: usize,
-        n_mem: usize,
         device: &Device,
-    ) -> Result<(Tensor, Vec<Tensor>)> {
+    ) -> Result<(
+        Tensor,
+        Vec<Tensor>,
+        Option<MemoryDiagnostics>,
+        Option<MemoryTrainingSignals>,
+    )> {
+        let n_mem = self.config.n_mem_slots;
         let trie_depth = self.config.trie_depth;
 
-        // Mean-pool across seq_len → [batch, 1, d_model]
-        let mean_emb = embedded.mean(1)?.unsqueeze(1)?;
-
-        // Run AddrNets on the mean embedding: 3 × (addresses, logits)
-        let addr_results = self.addr_nets.forward(&mean_emb, gumbel_temp, true)?;
+        // Run AddrNets on token-local query states: 3 × (addresses, logits)
+        let addr_results = self.addr_nets.forward(query_states, gumbel_temp, true)?;
 
         let read_addr_logits: Vec<Tensor> = addr_results.iter().map(|(_, l)| l.clone()).collect();
 
         // For each AddrNet output, convert hard one-hot to byte indices and read from trie
         let mut mem_vecs = Vec::with_capacity(n_mem);
-        let mut all_density_chains = Vec::with_capacity(batch * n_mem);
+        let mut all_density_chains = Vec::with_capacity(batch * seq_len * n_mem);
+        let mut read_addresses = Vec::with_capacity(n_mem);
 
         for (addresses, _logits) in &addr_results {
-            // addresses: [batch, 1, trie_depth, trie_arity] → argmax → [batch, 1, trie_depth]
-            let byte_indices = addresses.argmax(candle_core::D::Minus1)?.squeeze(1)?;
+            // addresses: [batch, seq_len, trie_depth, trie_arity] → argmax → [batch, seq_len, trie_depth]
+            let byte_indices = addresses.argmax(candle_core::D::Minus1)?;
 
-            let mut batch_vecs = Vec::with_capacity(batch);
+            let mut batch_vecs = Vec::with_capacity(batch * seq_len);
+            let mut slot_addresses = Vec::with_capacity(batch * seq_len);
             for b in 0..batch {
-                let addr_row = byte_indices.get(b)?;
-                let addr_bytes: Vec<u8> = addr_row
-                    .to_vec1::<u32>()?
-                    .iter()
-                    .map(|&v| v as u8)
-                    .collect();
+                let token_rows = byte_indices.get(b)?;
+                for t in 0..seq_len {
+                    let addr_row = token_rows.get(t)?;
+                    let addr_bytes: Vec<u8> = addr_row
+                        .to_vec1::<u32>()?
+                        .iter()
+                        .map(|&v| v as u8)
+                        .collect();
 
-                batch_vecs.push(trie.read(&addr_bytes, device)?);
-                all_density_chains.push(trie.density_chain(&addr_bytes));
+                    batch_vecs.push(trie.read(&addr_bytes, device)?);
+                    all_density_chains.push(trie.density_chain(&addr_bytes));
+                    slot_addresses.push(addr_bytes);
+                }
             }
-            mem_vecs.push(Tensor::stack(&batch_vecs, 0)?); // [batch, d_model]
+            mem_vecs.push(Tensor::stack(&batch_vecs, 0)?.reshape((batch, seq_len, d))?);
+            read_addresses.push(slot_addresses);
         }
 
-        // Stack → [batch, n_mem, d_model]
-        let mem_stacked = Tensor::stack(&mem_vecs, 1)?;
+        // Stack → [batch, seq_len, n_mem, d_model]
+        let mem_stacked = Tensor::stack(&mem_vecs, 2)?;
 
-        // Build density chain tensor [batch, n_mem, trie_depth]
+        // Build density chain tensor [batch, seq_len, n_mem, trie_depth]
         let density_flat: Vec<u32> = all_density_chains
             .iter()
             .flat_map(|chain| {
@@ -322,23 +399,138 @@ impl ZenoAgent {
             })
             .collect();
 
-        // density_chains is ordered [addr0_batch0, addr0_batch1, ..., addr1_batch0, ...]
-        // but we need [batch, n_mem, trie_depth] — reshape handles row-major ordering
-        // which matches: for each addr_net (n_mem), for each batch item, we have trie_depth values
-        // so shape is [n_mem, batch, trie_depth] → transpose to [batch, n_mem, trie_depth]
         let density_tensor =
-            Tensor::from_vec(density_flat, (n_mem, batch, trie_depth), device)?
+            Tensor::from_vec(density_flat, (n_mem, batch, seq_len, trie_depth), device)?
                 .transpose(0, 1)?
+                .transpose(1, 2)?
                 .contiguous()?;
 
-        // Confidence gate → [batch, n_mem]
-        let confidence = self.confidence_gate.forward(&density_tensor)?;
+        let confidence = self
+            .confidence_gate
+            .forward(&density_tensor.reshape((batch * seq_len, n_mem, trie_depth))?)?
+            .reshape((batch, seq_len, n_mem))?;
 
-        // Modulate memory by confidence: broadcast [batch, n_mem] → [batch, n_mem, d]
-        let confidence_expanded = confidence.unsqueeze(2)?.broadcast_as((batch, n_mem, d))?;
+        // Modulate memory by confidence: broadcast [batch, seq_len, n_mem] → [..., d]
+        let confidence_expanded = confidence
+            .unsqueeze(3)?
+            .broadcast_as((batch, seq_len, n_mem, d))?;
         let memory_pool = (mem_stacked * confidence_expanded)?;
 
-        Ok((memory_pool, read_addr_logits))
+        let confidence_rows = confidence.to_vec3::<f32>()?;
+        let mut read_hits = 0usize;
+        let mut read_misses = 0usize;
+        let mut sum_mean_density = 0.0;
+        let mut sum_final_density = 0.0;
+        let mut sum_confidence = 0.0;
+        let mut min_confidence = f64::INFINITY;
+        let mut max_confidence = f64::NEG_INFINITY;
+        let mut sum_hit_confidence = 0.0;
+        let mut sum_miss_confidence = 0.0;
+        let mut corr_pairs = Vec::with_capacity(batch * seq_len * n_mem);
+
+        for b in 0..batch {
+            for t in 0..seq_len {
+                for slot in 0..n_mem {
+                    let chain = &all_density_chains[slot * batch * seq_len + b * seq_len + t];
+                    let final_density = chain.last().copied().unwrap_or(0) as f64;
+                    let mean_density = if chain.is_empty() {
+                        0.0
+                    } else {
+                        chain.iter().sum::<usize>() as f64 / chain.len() as f64
+                    };
+                    let conf = confidence_rows[b][t][slot] as f64;
+                    if final_density > 0.0 {
+                        read_hits += 1;
+                        sum_hit_confidence += conf;
+                    } else {
+                        read_misses += 1;
+                        sum_miss_confidence += conf;
+                    }
+                    sum_mean_density += mean_density;
+                    sum_final_density += final_density;
+                    sum_confidence += conf;
+                    min_confidence = min_confidence.min(conf);
+                    max_confidence = max_confidence.max(conf);
+                    corr_pairs.push((final_density, conf));
+                }
+            }
+        }
+
+        let mut overlap_pairs = 0usize;
+        let total_pairs = batch * seq_len * (n_mem.saturating_sub(1) * n_mem / 2);
+        for b in 0..batch {
+            for t in 0..seq_len {
+                let token_idx = b * seq_len + t;
+                for i in 0..n_mem {
+                    for j in (i + 1)..n_mem {
+                        if read_addresses[i][token_idx] == read_addresses[j][token_idx] {
+                            overlap_pairs += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let slots = (batch * seq_len * n_mem).max(1) as f64;
+        let mean_x = corr_pairs.iter().map(|(x, _)| *x).sum::<f64>() / slots;
+        let mean_y = corr_pairs.iter().map(|(_, y)| *y).sum::<f64>() / slots;
+        let mut cov = 0.0;
+        let mut var_x = 0.0;
+        let mut var_y = 0.0;
+        for (x, y) in &corr_pairs {
+            cov += (x - mean_x) * (y - mean_y);
+            var_x += (x - mean_x).powi(2);
+            var_y += (y - mean_y).powi(2);
+        }
+        let density_confidence_corr = if var_x > 0.0 && var_y > 0.0 {
+            cov / (var_x.sqrt() * var_y.sqrt())
+        } else {
+            0.0
+        };
+
+        let diagnostics = MemoryDiagnostics {
+            read_hits,
+            read_misses,
+            overlap_pairs,
+            total_pairs,
+            avg_mean_density: sum_mean_density / slots,
+            avg_final_density: sum_final_density / slots,
+            avg_confidence: sum_confidence / slots,
+            min_confidence: if min_confidence.is_finite() {
+                min_confidence
+            } else {
+                0.0
+            },
+            max_confidence: if max_confidence.is_finite() {
+                max_confidence
+            } else {
+                0.0
+            },
+            avg_hit_confidence: if read_hits > 0 {
+                sum_hit_confidence / read_hits as f64
+            } else {
+                0.0
+            },
+            avg_miss_confidence: if read_misses > 0 {
+                sum_miss_confidence / read_misses as f64
+            } else {
+                0.0
+            },
+            density_confidence_corr,
+        };
+
+        let training = MemoryTrainingSignals {
+            density: density_tensor,
+            confidence: confidence.clone(),
+            read_addresses,
+        };
+
+        Ok((
+            memory_pool,
+            read_addr_logits,
+            Some(diagnostics),
+            Some(training),
+        ))
     }
 
     /// Param name prefixes to train in Phase 2 (base LM, no memory).
@@ -358,11 +550,12 @@ impl ZenoAgent {
 
     /// Param name prefixes to train in Phase 4 (memory integration).
     pub fn phase4_params(&self) -> Vec<String> {
-        vec![
-            "addr_nets".to_string(),
-            "confidence_gate".to_string(),
-            "output_heads".to_string(),
-        ]
+        let mut prefixes = vec!["confidence_gate".to_string()];
+        for i in 0..self.config.n_layers {
+            prefixes.push(format!("block_{i}.mem_attn"));
+            prefixes.push(format!("block_{i}.norm3"));
+        }
+        prefixes
     }
 }
 
@@ -430,8 +623,13 @@ mod tests {
         let batch = 2;
         let seq = 8;
         let x = Tensor::randn(0f32, 1.0, (batch, seq, cfg.d_model), dev)?;
-        let ctx = Tensor::randn(0f32, 1.0, (batch, cfg.context_pool_size(), cfg.d_model), dev)?;
-        let mem = Tensor::randn(0f32, 1.0, (batch, cfg.n_mem_slots, cfg.d_model), dev)?;
+        let ctx = Tensor::randn(
+            0f32,
+            1.0,
+            (batch, cfg.context_pool_size(), cfg.d_model),
+            dev,
+        )?;
+        let mem = Tensor::randn(0f32, 1.0, (batch, seq, cfg.n_mem_slots, cfg.d_model), dev)?;
 
         let out = block.forward(&x, 0, &ctx, &mem)?;
         assert_eq!(out.dims(), &[batch, seq, cfg.d_model]);
@@ -474,6 +672,7 @@ mod tests {
         assert_eq!(out.write_values.len(), cfg.n_addr_nets);
         assert_eq!(out.write_strength.dims(), &[batch, seq, 1]);
         assert!(out.read_addr_logits.is_empty());
+        assert!(out.memory_training.is_none());
         Ok(())
     }
 
@@ -497,8 +696,31 @@ mod tests {
         assert_eq!(out.logits.dims(), &[batch, seq, cfg.vocab_size]);
         assert_eq!(out.read_addr_logits.len(), cfg.n_addr_nets);
         for logit in &out.read_addr_logits {
-            assert_eq!(logit.dims(), &[batch, 1, cfg.trie_depth, cfg.trie_arity]);
+            assert_eq!(logit.dims(), &[batch, seq, cfg.trie_depth, cfg.trie_arity]);
         }
+        let diag = out
+            .memory_diagnostics
+            .as_ref()
+            .expect("memory diagnostics should be populated when memory is enabled");
+        let training = out
+            .memory_training
+            .as_ref()
+            .expect("memory training signals should be populated when memory is enabled");
+        assert_eq!(
+            diag.read_hits + diag.read_misses,
+            batch * seq * cfg.n_mem_slots,
+            "diagnostics should account for every token-local read slot"
+        );
+        assert_eq!(
+            diag.total_pairs,
+            batch * seq * (cfg.n_mem_slots * (cfg.n_mem_slots - 1) / 2)
+        );
+        assert_eq!(training.confidence.dims(), &[batch, seq, cfg.n_mem_slots]);
+        assert_eq!(
+            training.density.dims(),
+            &[batch, seq, cfg.n_mem_slots, cfg.trie_depth]
+        );
+        assert_eq!(training.read_addresses.len(), cfg.n_mem_slots);
         Ok(())
     }
 
@@ -520,7 +742,9 @@ mod tests {
 
         let p4 = agent.phase4_params();
         assert!(p4.contains(&"confidence_gate".to_string()));
-        assert!(p4.contains(&"output_heads".to_string()));
+        assert!(p4.iter().any(|prefix| prefix.contains("mem_attn")));
+        assert!(p4.iter().any(|prefix| prefix.contains("norm3")));
+        assert!(!p4.contains(&"output_heads".to_string()));
         Ok(())
     }
 }

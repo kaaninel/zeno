@@ -180,7 +180,7 @@ impl AddrNetBank {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, DType};
+    use candle_core::{DType, Device};
     use candle_nn::VarMap;
 
     fn test_cfg() -> ZenoConfig {
@@ -202,7 +202,10 @@ mod tests {
         let (addresses, logits) = net.forward(&hidden, 1.0, false)?;
 
         assert_eq!(logits.dims(), &[batch, seq, cfg.trie_depth, cfg.trie_arity]);
-        assert_eq!(addresses.dims(), &[batch, seq, cfg.trie_depth, cfg.trie_arity]);
+        assert_eq!(
+            addresses.dims(),
+            &[batch, seq, cfg.trie_depth, cfg.trie_arity]
+        );
         Ok(())
     }
 
@@ -221,7 +224,10 @@ mod tests {
         let sums = addresses.sum(candle_core::D::Minus1)?;
         let expected = Tensor::ones_like(&sums)?;
         let diff = (sums - expected)?.abs()?.sum_all()?.to_scalar::<f32>()?;
-        assert!(diff < 1e-4, "hard one-hot rows should sum to 1.0, diff={diff}");
+        assert!(
+            diff < 1e-4,
+            "hard one-hot rows should sum to 1.0, diff={diff}"
+        );
         Ok(())
     }
 

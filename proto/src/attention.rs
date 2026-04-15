@@ -10,11 +10,7 @@ use crate::config::ZenoConfig;
 /// Build interleaved cos/sin tables for Rotary Position Embeddings.
 ///
 /// Returns `(cos, sin)` each of shape `[max_len, head_dim/2]`.
-fn build_rope_tables(
-    max_len: usize,
-    head_dim: usize,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
+fn build_rope_tables(max_len: usize, head_dim: usize, device: &Device) -> Result<(Tensor, Tensor)> {
     let half = head_dim / 2;
 
     // θ_i = 1 / 10000^(2i / head_dim)  for i in 0..half
@@ -34,12 +30,7 @@ fn build_rope_tables(
 }
 
 /// Apply interleaved RoPE to a tensor of shape `[batch, n_heads, seq_len, head_dim]`.
-fn apply_rope(
-    x: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    pos_offset: usize,
-) -> Result<Tensor> {
+fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, pos_offset: usize) -> Result<Tensor> {
     let seq_len = x.dim(2)?;
     let cos = cos.narrow(0, pos_offset, seq_len)?;
     let sin = sin.narrow(0, pos_offset, seq_len)?;
@@ -220,13 +211,29 @@ impl CrossAttention {
         let v = v.reshape((b, s, h, hd))?.transpose(1, 2)?;
 
         let scale = (hd as f64).sqrt();
-        let attn_weights =
-            (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? / scale)?;
+        let attn_weights = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? / scale)?;
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
 
         let out = attn_weights.matmul(&v.contiguous()?)?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, t, h * hd))?;
         out.apply(&self.o_proj)
+    }
+
+    /// Forward pass with token-local key/value slots.
+    ///
+    /// Flattens `[batch, seq_len]` into an expanded batch dimension so each token
+    /// attends only over its own memory slots.
+    pub fn forward_per_token(&self, q_input: &Tensor, kv_input: &Tensor) -> Result<Tensor> {
+        let (batch, seq_len, d_model) = q_input.dims3()?;
+        let (kv_batch, kv_seq_len, n_slots, kv_d_model) = kv_input.dims4()?;
+        debug_assert_eq!(batch, kv_batch);
+        debug_assert_eq!(seq_len, kv_seq_len);
+        debug_assert_eq!(d_model, kv_d_model);
+
+        let q_flat = q_input.reshape((batch * seq_len, 1, d_model))?;
+        let kv_flat = kv_input.reshape((batch * seq_len, n_slots, d_model))?;
+        self.forward(&q_flat, &kv_flat)?
+            .reshape((batch, seq_len, d_model))
     }
 }
 
@@ -308,6 +315,22 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_attention_per_token_slots() -> Result<()> {
+        let cfg = ZenoConfig::default_proto();
+        let dev = &Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, dev);
+
+        let xattn = CrossAttention::new(vb, &cfg)?;
+
+        let q = Tensor::randn(0f32, 1.0, (2, 8, cfg.d_model), dev)?;
+        let kv = Tensor::randn(0f32, 1.0, (2, 8, cfg.n_mem_slots, cfg.d_model), dev)?;
+        let out = xattn.forward_per_token(&q, &kv)?;
+        assert_eq!(out.dims(), &[2, 8, cfg.d_model]);
+        Ok(())
+    }
+
+    #[test]
     fn test_self_attention_is_causal() -> Result<()> {
         let cfg = ZenoConfig::default_proto();
         let dev = &Device::Cpu;
@@ -346,11 +369,7 @@ mod tests {
         // Q,K,V: 96*96=9216 each (no bias) = 27648
         // O: 96*96 + 96 = 9312
         // Total = 36960
-        let total: usize = varmap
-            .all_vars()
-            .iter()
-            .map(|v| v.elem_count())
-            .sum();
+        let total: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
         assert_eq!(total, 36_960);
         Ok(())
     }
@@ -365,11 +384,7 @@ mod tests {
         let _xattn = CrossAttention::new(vb, &cfg)?;
 
         // Same structure as self-attention projections
-        let total: usize = varmap
-            .all_vars()
-            .iter()
-            .map(|v| v.elem_count())
-            .sum();
+        let total: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
         assert_eq!(total, 36_960);
         Ok(())
     }
